@@ -6,14 +6,14 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
 
-func GenerateSecureKey() error {
-	return errors.New("GenerateSecureKey is deprecated; use GenerateSecureKeyString instead")
+// Deprecated: Use GenerateSecureKeyString instead.
+func GenerateSecureKey() (string, error) {
+	return GenerateSecureKeyString()
 }
 
 func GenerateSecureKeyString() (string, error) {

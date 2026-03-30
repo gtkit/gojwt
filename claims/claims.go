@@ -11,12 +11,14 @@ type Claims struct {
 	jwtv5.RegisteredClaims
 
 	UserID  int64    `json:"uid"`
-	Prv     string   `json:"prv,omitzero"`
+	Prv     string   `json:"prv,omitempty"`
 	Roles   []string `json:"roles,omitzero"`
 	TokenID string   `json:"token_id"`
 }
 
 type Option func(*Claims)
+
+// Deprecated: Use Option instead.
 type Options = Option
 
 func WithRole(role string) Option {

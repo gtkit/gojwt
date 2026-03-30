@@ -124,8 +124,9 @@ func TestRefreshTokenReturnsErrRefreshTooEarly(t *testing.T) {
 }
 
 func TestGenerateSecureKeyIsDeprecated(t *testing.T) {
-	err := gojwt.GenerateSecureKey()
-	require.EqualError(t, err, "GenerateSecureKey is deprecated; use GenerateSecureKeyString instead")
+	key, err := gojwt.GenerateSecureKey()
+	require.NoError(t, err)
+	require.NotEmpty(t, key)
 }
 
 func TestBlacklistConcurrentAccess(t *testing.T) {
@@ -133,15 +134,12 @@ func TestBlacklistConcurrentAccess(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for i := range 64 {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-
+		wg.Go(func() {
 			tokenID := fmt.Sprintf("token-%d", i)
 			blacklist.Add(tokenID)
 			_ = blacklist.In(tokenID)
 			blacklist.Remove(tokenID)
-		}(i)
+		})
 	}
 	wg.Wait()
 }

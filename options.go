@@ -8,6 +8,8 @@ type duration struct {
 }
 
 type Option func(*duration)
+
+// Deprecated: Use Option instead.
 type Options = Option
 
 func WithTokenDuration(t time.Duration) Option {
