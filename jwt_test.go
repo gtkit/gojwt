@@ -123,7 +123,7 @@ func TestRefreshTokenReturnsErrRefreshTooEarly(t *testing.T) {
 	require.ErrorIs(t, err, gojwt.ErrRefreshTooEarly)
 }
 
-func TestGenerateSecureKeyIsDeprecated(t *testing.T) {
+func TestGenerateSecureKeyDeprecated(t *testing.T) {
 	key, err := gojwt.GenerateSecureKey()
 	require.NoError(t, err)
 	require.NotEmpty(t, key)
@@ -172,4 +172,159 @@ func TestClaimsOmitZeroFieldsInJSON(t *testing.T) {
 func TestTokenerImplementations(t *testing.T) {
 	var _ gojwt.Tokener = (*gojwt.JwtHmac)(nil)
 	var _ gojwt.Tokener = (*gojwt.JwtEd25519)(nil)
+}
+
+// ======================== 黑名单注入测试 ========================
+
+func TestBlacklistFuncBlocksParseToken(t *testing.T) {
+	blacklist := gojwt.NewBlacklist()
+	key := []byte("t8yij6okp2ldadg7feqoibjladj92gjh")
+
+	j, err := gojwt.NewJwtHmac(key, gojwt.WithBlacklistFunc(blacklist.In))
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(10)
+	require.NoError(t, err)
+
+	// 正常解析
+	tokenClaims, err := j.ParseToken(token)
+	require.NoError(t, err)
+	require.Equal(t, int64(10), tokenClaims.UserID)
+
+	// 加入黑名单后解析失败
+	blacklist.Add(tokenClaims.TokenID)
+	_, err = j.ParseToken(token)
+	require.ErrorIs(t, err, gojwt.ErrTokenBlacklisted)
+
+	// 从黑名单移除后恢复正常
+	blacklist.Remove(tokenClaims.TokenID)
+	_, err = j.ParseToken(token)
+	require.NoError(t, err)
+}
+
+func TestBlacklistFuncBlocksCachedParseToken(t *testing.T) {
+	blacklist := gojwt.NewBlacklist()
+	key := []byte("t8yij6okp2ldadg7feqoibjladj92gjh")
+
+	j, err := gojwt.NewJwtHmac(key, gojwt.WithBlacklistFunc(blacklist.In))
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(20)
+	require.NoError(t, err)
+
+	// 首次解析（写入缓存）
+	tokenClaims, err := j.CachedParseToken(token)
+	require.NoError(t, err)
+
+	// 加入黑名单后，缓存命中但仍被拦截
+	blacklist.Add(tokenClaims.TokenID)
+	_, err = j.CachedParseToken(token)
+	require.ErrorIs(t, err, gojwt.ErrTokenBlacklisted)
+}
+
+func TestBlacklistFuncWithCustomCallback(t *testing.T) {
+	// 模拟 Redis EXISTS 风格的外部检查函数
+	revokedTokens := map[string]struct{}{
+		"revoked-token-001": {},
+	}
+	isRevoked := func(tokenID string) bool {
+		_, ok := revokedTokens[tokenID]
+		return ok
+	}
+
+	key := []byte("t8yij6okp2ldadg7feqoibjladj92gjh")
+	j, err := gojwt.NewJwtHmac(key, gojwt.WithBlacklistFunc(isRevoked))
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(30)
+	require.NoError(t, err)
+
+	// 正常 token 不在黑名单中，解析成功
+	_, err = j.ParseToken(token)
+	require.NoError(t, err)
+}
+
+func TestNoBlacklistFuncSkipsCheck(t *testing.T) {
+	key := []byte("t8yij6okp2ldadg7feqoibjladj92gjh")
+
+	// 不注入 WithBlacklistFunc，黑名单检查被跳过
+	j, err := gojwt.NewJwtHmac(key)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(40)
+	require.NoError(t, err)
+
+	_, err = j.ParseToken(token)
+	require.NoError(t, err)
+}
+
+func TestBlacklistFuncWithEd25519(t *testing.T) {
+	blacklist := gojwt.NewBlacklist()
+	dir := t.TempDir()
+	priPath := filepath.Join(dir, "jwt_ed25519.pem")
+	pubPath := filepath.Join(dir, "jwt_ed25519.pub.pem")
+
+	require.NoError(t, gojwt.GenerateEd25519Keys(priPath, pubPath))
+
+	j, err := gojwt.NewJwtEd25519(priPath, pubPath, gojwt.WithBlacklistFunc(blacklist.In))
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(50)
+	require.NoError(t, err)
+
+	tokenClaims, err := j.ParseToken(token)
+	require.NoError(t, err)
+
+	blacklist.Add(tokenClaims.TokenID)
+	_, err = j.ParseToken(token)
+	require.ErrorIs(t, err, gojwt.ErrTokenBlacklisted)
+}
+
+func TestBlacklistFuncWithEd25519CachedParse(t *testing.T) {
+	blacklist := gojwt.NewBlacklist()
+	dir := t.TempDir()
+	priPath := filepath.Join(dir, "jwt_ed25519.pem")
+	pubPath := filepath.Join(dir, "jwt_ed25519.pub.pem")
+
+	require.NoError(t, gojwt.GenerateEd25519Keys(priPath, pubPath))
+
+	j, err := gojwt.NewJwtEd25519(priPath, pubPath, gojwt.WithBlacklistFunc(blacklist.In))
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(60)
+	require.NoError(t, err)
+
+	// 首次缓存解析
+	tokenClaims, err := j.CachedParseToken(token)
+	require.NoError(t, err)
+
+	// 加入黑名单后缓存命中仍被拦截
+	blacklist.Add(tokenClaims.TokenID)
+	_, err = j.CachedParseToken(token)
+	require.ErrorIs(t, err, gojwt.ErrTokenBlacklisted)
+}
+
+func TestRefreshTokenAlsoChecksBlacklist(t *testing.T) {
+	blacklist := gojwt.NewBlacklist()
+	key := []byte("t8yij6okp2ldadg7feqoibjladj92gjh")
+
+	j, err := gojwt.NewJwtHmac(
+		key,
+		gojwt.WithTokenDuration(time.Second),
+		gojwt.WithRefreshDuration(time.Minute),
+		gojwt.WithBlacklistFunc(blacklist.In),
+	)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(70)
+	require.NoError(t, err)
+
+	// 先正常解析拿到 tokenID
+	tokenClaims, err := j.ParseToken(token)
+	require.NoError(t, err)
+
+	// 加入黑名单后刷新也应失败（因为 RefreshToken 内部调用了 ParseToken）
+	blacklist.Add(tokenClaims.TokenID)
+	_, err = j.RefreshToken(token)
+	require.ErrorIs(t, err, gojwt.ErrTokenBlacklisted)
 }

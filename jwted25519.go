@@ -14,13 +14,16 @@ import (
 	"github.com/gtkit/gojwt/claims"
 )
 
+// JwtEd25519 基于 Ed25519 (EdDSA) 签名的 JWT 实例。
 type JwtEd25519 struct {
 	privateKey ed25519.PrivateKey
 	publicKey  ed25519.PublicKey
-	duration
+	config
 	cache claimsCache
 }
 
+// NewJwtEd25519 从 PEM 文件加载 Ed25519 密钥对，创建 JWT 实例。
+// priPath 为 PKCS8 格式私钥路径，pubPath 为 PKIX 格式公钥路径。
 func NewJwtEd25519(priPath, pubPath string, options ...Option) (*JwtEd25519, error) {
 	privateKey, err := readEd25519PrivateKey(priPath)
 	if err != nil {
@@ -34,18 +37,18 @@ func NewJwtEd25519(priPath, pubPath string, options ...Option) (*JwtEd25519, err
 	j := &JwtEd25519{
 		privateKey: privateKey,
 		publicKey:  publicKey,
-		duration: duration{
-			tokenDuration:   2 * time.Hour,
-			refreshDuration: 7 * 24 * time.Hour,
-		},
+		config:     defaultConfig(),
 	}
 	for _, opt := range options {
-		opt(&j.duration)
+		opt(&j.config)
 	}
 
 	return j, nil
 }
 
+// GenerateToken 根据用户 ID 生成 JWT token。
+// 自动写入 exp、iat、nbf 并生成唯一 TokenID。
+// 可通过 claims.Option 附加业务字段。
 func (j *JwtEd25519) GenerateToken(uid int64, options ...claims.Option) (string, error) {
 	if j == nil {
 		return "", ErrJWTNotInit
@@ -71,14 +74,11 @@ func (j *JwtEd25519) GenerateToken(uid int64, options ...claims.Option) (string,
 		opt(tokenClaims)
 	}
 
-	token, err := createEd25519Token(*tokenClaims, j.privateKey)
-	if err != nil {
-		return "", err
-	}
-
-	return token, nil
+	return createEd25519Token(*tokenClaims, j.privateKey)
 }
 
+// RefreshToken 在刷新窗口内刷新 JWT token。
+// 仅当 token 距过期不足 refreshWindow（5 分钟）时允许刷新。
 func (j *JwtEd25519) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (string, error) {
 	if j == nil {
 		return "", ErrJWTNotInit
@@ -96,6 +96,10 @@ func (j *JwtEd25519) RefreshToken(tokenString string, opt ...jwtv5.ParserOption)
 	return createEd25519Token(*tokenClaims, j.privateKey)
 }
 
+// ParseToken 解析并验证 JWT token。
+// 完成 Ed25519 签名验证后返回 *claims.Claims。
+// 如果通过 WithBlacklistFunc 配置了黑名单检查函数，
+// 解析成功后会自动检查 tokenID 是否被拉黑。
 func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	if j == nil {
 		return nil, ErrJWTNotInit
@@ -113,12 +117,21 @@ func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (
 		return nil, normalizeParseError(err)
 	}
 
-	if c, ok := token.Claims.(*claims.Claims); ok && token.Valid {
-		return c, nil
+	c, ok := token.Claims.(*claims.Claims)
+	if !ok || !token.Valid {
+		return nil, ErrTokenInvalid
 	}
-	return nil, ErrTokenInvalid
+
+	// 黑名单检查
+	if j.isBlacklisted != nil && c.TokenID != "" && j.isBlacklisted(c.TokenID) {
+		return nil, ErrTokenBlacklisted
+	}
+
+	return c, nil
 }
 
+// CachedParseToken 带缓存的 ParseToken，相同 tokenString 不重复解析。
+// 即使缓存命中，仍会检查黑名单。
 func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	if j == nil {
 		return nil, ErrJWTNotInit
@@ -128,6 +141,10 @@ func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwtv5.ParserOpt
 	}
 
 	if c, ok := loadCachedClaims(&j.cache, tokenString); ok {
+		// 缓存命中后仍需检查黑名单
+		if j.isBlacklisted != nil && c.TokenID != "" && j.isBlacklisted(c.TokenID) {
+			return nil, ErrTokenBlacklisted
+		}
 		return c, nil
 	}
 
@@ -140,6 +157,8 @@ func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwtv5.ParserOpt
 	return tokenClaims, nil
 }
 
+// ParallelVerify 并发验证多个 token。
+// results[i] 与 errs[i] 对应同一个输入 tokens[i]。
 func (j *JwtEd25519) ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
 	var wg sync.WaitGroup
 	results := make([]*claims.Claims, len(tokens))
@@ -157,10 +176,13 @@ func (j *JwtEd25519) ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) 
 	return results, errs
 }
 
+// createEd25519Token 使用 EdDSA 签名并返回 token 字符串。
 func createEd25519Token(claims claims.Claims, signKey any) (string, error) {
 	return jwtv5.NewWithClaims(jwtv5.SigningMethodEdDSA, claims).SignedString(signKey)
 }
 
+// readEd25519PrivateKey 从 PEM 文件读取 Ed25519 私钥。
+// 支持 "ED25519 PRIVATE KEY"（原始格式）和 "PRIVATE KEY"（PKCS8 格式）。
 func readEd25519PrivateKey(path string) (ed25519.PrivateKey, error) {
 	block, err := readPEMBlock(path)
 	if err != nil {
@@ -188,6 +210,8 @@ func readEd25519PrivateKey(path string) (ed25519.PrivateKey, error) {
 	}
 }
 
+// readEd25519PublicKey 从 PEM 文件读取 Ed25519 公钥。
+// 支持 "ED25519 PUBLIC KEY"（原始格式）和 "PUBLIC KEY"（PKIX 格式）。
 func readEd25519PublicKey(path string) (ed25519.PublicKey, error) {
 	block, err := readPEMBlock(path)
 	if err != nil {
@@ -215,6 +239,7 @@ func readEd25519PublicKey(path string) (ed25519.PublicKey, error) {
 	}
 }
 
+// readPEMBlock 从文件读取并解码 PEM 块。
 func readPEMBlock(path string) (*pem.Block, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

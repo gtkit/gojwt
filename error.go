@@ -6,6 +6,8 @@ import (
 	"github.com/gtkit/gojwt/claims"
 )
 
+// 主包 sentinel error 定义。
+// 推荐使用 errors.Is 进行判断。
 var (
 	ErrJWTNotInit                = errors.New("JWT 未初始化")
 	ErrInvalidKey                = errors.New("密钥无效")
@@ -23,6 +25,7 @@ var (
 	ErrTokenInvalidID            = errors.New("Token ID 无效")
 	ErrTokenInvalidClaims        = errors.New("Token 参数无效")
 	ErrTokenInvalid              = errors.New("Token 无效")
+	ErrTokenBlacklisted          = errors.New("Token 已被注销")
 	ErrRefreshTooEarly           = errors.New("未到 Token 刷新时间窗口")
 	ErrTokenRole                 = claims.ErrTokenRole
 	ErrTokenPrv                  = claims.ErrTokenPrv

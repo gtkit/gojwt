@@ -11,11 +11,15 @@ import (
 	"path/filepath"
 )
 
-// Deprecated: Use GenerateSecureKeyString instead.
+// GenerateSecureKey 生成随机 HMAC 密钥字符串。
+//
+// Deprecated: 请使用 GenerateSecureKeyString。
 func GenerateSecureKey() (string, error) {
 	return GenerateSecureKeyString()
 }
 
+// GenerateSecureKeyString 生成 32 字节随机密钥，并以 RawURLBase64 编码返回。
+// 适用于 HMAC-SHA256 签名场景。
 func GenerateSecureKeyString() (string, error) {
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
@@ -24,6 +28,9 @@ func GenerateSecureKeyString() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(key), nil
 }
 
+// GenerateEd25519Keys 生成 Ed25519 密钥对并写入指定路径的 PEM 文件。
+// priPath 为私钥文件路径，pubPath 为公钥文件路径。
+// 私钥文件权限 0600，公钥文件权限 0644。
 func GenerateEd25519Keys(priPath, pubPath string) error {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -64,6 +71,7 @@ func GenerateEd25519Keys(priPath, pubPath string) error {
 	return nil
 }
 
+// generateTokenID 生成 16 字节随机 token ID，以 RawURLBase64 编码返回。
 func generateTokenID() (string, error) {
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
