@@ -21,7 +21,7 @@ tag:
 	newpatch=$$(expr $$patch + 1); \
 	new="v$$maj.$$min.$$newpatch"; \
 	printf "Bump: v%s -> %s\n" "$$current" "$$new"; \
-	sed -E -i.bak 's/(const Version = ")([^"]+)(")/\1'"$$new"'\3/' version.go; \
+	sed -E -i.bak 's/(var Version = ")([^"]+)(")/\1'"$$new"'\3/' version.go; \
 	git add version.go; \
 	git commit -m "chore(release): $$new"; \
 	printf "Release: %s\n" "$$new"; \

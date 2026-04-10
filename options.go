@@ -1,16 +1,31 @@
 package gojwt
 
-import "time"
+import (
+	"fmt"
+	"time"
+
+	jwtv5 "github.com/golang-jwt/jwt/v5"
+)
 
 // config 是 JwtHmac / JwtEd25519 的内部配置。
 type config struct {
 	tokenDuration   time.Duration
 	refreshDuration time.Duration
+	parseLeeway     time.Duration
 
 	// isBlacklisted 是外部注入的黑名单检查函数。
 	// 返回 true 表示该 tokenID 已被拉黑（已注销/已撤回）。
 	// 为 nil 时跳过黑名单检查。
 	isBlacklisted func(tokenID string) bool
+
+	// blacklistCheckFunc 支持返回错误的黑名单检查函数。
+	// 用于 Redis/DB 等外部存储故障时 fail closed。
+	blacklistCheckFunc func(tokenID string) (bool, error)
+
+	// hmacSigningMethod 为 JwtHmac 指定签名算法。
+	// 默认使用 HS256，可显式切换到 HS384 / HS512。
+	hmacSigningMethod *jwtv5.SigningMethodHMAC
+	hmacSigningSet    bool
 }
 
 // Option 配置 JwtHmac / JwtEd25519 实例的选项函数。
@@ -35,6 +50,14 @@ func WithRefreshDuration(t time.Duration) Option {
 	}
 }
 
+// WithParseLeeway 设置 JWT 解析时对 exp / nbf / iat 的容忍时间。
+// 默认 5 秒，用于吸收多机之间的轻微时钟漂移。
+func WithParseLeeway(t time.Duration) Option {
+	return func(c *config) {
+		c.parseLeeway = t
+	}
+}
+
 // WithBlacklistFunc 注入外部黑名单检查函数。
 //
 // fn 接收 tokenID（即 Claims.TokenID / RegisteredClaims.ID），
@@ -47,16 +70,33 @@ func WithRefreshDuration(t time.Duration) Option {
 //
 //   - Redis 黑名单：
 //     gojwt.WithBlacklistFunc(func(tid string) bool {
-//         return rdb.Exists(ctx, "jwt:blacklist:"+tid).Val() > 0
+//     return rdb.Exists(ctx, "jwt:blacklist:"+tid).Val() > 0
 //     })
 //
 //   - DB 查询：
 //     gojwt.WithBlacklistFunc(func(tid string) bool {
-//         return repo.IsTokenRevoked(tid)
+//     return repo.IsTokenRevoked(tid)
 //     })
 func WithBlacklistFunc(fn func(tokenID string) bool) Option {
 	return func(c *config) {
 		c.isBlacklisted = fn
+	}
+}
+
+// WithBlacklistCheckFunc 注入支持返回错误的黑名单检查函数。
+// 当底层存储不可用时，应返回 error，使鉴权链路能够 fail closed。
+func WithBlacklistCheckFunc(fn func(tokenID string) (bool, error)) Option {
+	return func(c *config) {
+		c.blacklistCheckFunc = fn
+	}
+}
+
+// WithHMACSigningMethod 为 JwtHmac 设置签名算法。
+// 默认使用 HS256，可选 HS384、HS512。
+func WithHMACSigningMethod(method *jwtv5.SigningMethodHMAC) Option {
+	return func(c *config) {
+		c.hmacSigningMethod = method
+		c.hmacSigningSet = true
 	}
 }
 
@@ -65,5 +105,19 @@ func defaultConfig() config {
 	return config{
 		tokenDuration:   2 * time.Hour,
 		refreshDuration: 7 * 24 * time.Hour,
+		parseLeeway:     5 * time.Second,
 	}
+}
+
+func validateConfig(cfg config) error {
+	if cfg.tokenDuration <= 0 {
+		return fmt.Errorf("%w: token duration must be greater than zero", ErrInvalidConfig)
+	}
+	if cfg.refreshDuration <= 0 {
+		return fmt.Errorf("%w: refresh duration must be greater than zero", ErrInvalidConfig)
+	}
+	if cfg.parseLeeway < 0 {
+		return fmt.Errorf("%w: parse leeway must be greater than or equal to zero", ErrInvalidConfig)
+	}
+	return nil
 }

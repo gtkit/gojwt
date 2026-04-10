@@ -9,6 +9,7 @@ import (
 // 主包 sentinel error 定义。
 // 推荐使用 errors.Is 进行判断。
 var (
+	ErrInvalidConfig             = errors.New("invalid config")
 	ErrJWTNotInit                = errors.New("JWT 未初始化")
 	ErrInvalidKey                = errors.New("密钥无效")
 	ErrInvalidKeyType            = errors.New("密钥类型无效")
@@ -17,6 +18,7 @@ var (
 	ErrTokenUnverifiable         = errors.New("Token 无法验证")
 	ErrTokenSignatureInvalid     = errors.New("Token 签名无效")
 	ErrTokenRequiredClaimMissing = errors.New("Token 缺少必要的参数")
+	ErrTokenInvalidAudience      = errors.New("Token 受众无效")
 	ErrTokenExpired              = errors.New("Token 已过期")
 	ErrTokenUsedBeforeIssued     = errors.New("Token 已使用")
 	ErrTokenInvalidIssuer        = errors.New("Token 签发者无效")

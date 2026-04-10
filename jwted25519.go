@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 
 	jwtv5 "github.com/golang-jwt/jwt/v5"
@@ -42,6 +41,12 @@ func NewJwtEd25519(priPath, pubPath string, options ...Option) (*JwtEd25519, err
 	for _, opt := range options {
 		opt(&j.config)
 	}
+	if err := validateConfig(j.config); err != nil {
+		return nil, err
+	}
+	if j.config.hmacSigningSet {
+		return nil, fmt.Errorf("%w: HMAC signing method option is not applicable to Ed25519", ErrInvalidConfig)
+	}
 
 	return j, nil
 }
@@ -73,12 +78,15 @@ func (j *JwtEd25519) GenerateToken(uid int64, options ...claims.Option) (string,
 	for _, opt := range options {
 		opt(tokenClaims)
 	}
+	alignTokenIdentifiers(tokenClaims, tokenID)
 
 	return createEd25519Token(*tokenClaims, j.privateKey)
 }
 
 // RefreshToken 在刷新窗口内刷新 JWT token。
-// 仅当 token 距过期不足 refreshWindow（5 分钟）时允许刷新。
+// 仅当 token 距过期不足 refreshWindow（5 分钟）时允许刷新，
+// 否则返回 ErrRefreshTooEarly；超过 refreshDuration 则返回 ErrTokenExpired。
+// 刷新成功后会生成新的 TokenID/jti，并重置 iat、nbf，旧 token 与新 token 可独立吊销。
 func (j *JwtEd25519) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (string, error) {
 	if j == nil {
 		return "", ErrJWTNotInit
@@ -107,12 +115,16 @@ func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (
 	if tokenString == "" {
 		return nil, ErrTokenMalformed
 	}
+	parserOptions := append([]jwtv5.ParserOption{
+		jwtv5.WithValidMethods([]string{jwtv5.SigningMethodEdDSA.Alg()}),
+		jwtv5.WithLeeway(j.parseLeeway),
+	}, opt...)
 	token, err := jwtv5.ParseWithClaims(tokenString, &claims.Claims{}, func(token *jwtv5.Token) (any, error) {
-		if _, ok := token.Method.(*jwtv5.SigningMethodEd25519); !ok {
+		if token.Method == nil || token.Method.Alg() != jwtv5.SigningMethodEdDSA.Alg() {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return j.publicKey, nil
-	}, opt...)
+	}, parserOptions...)
 	if err != nil {
 		return nil, normalizeParseError(err)
 	}
@@ -122,9 +134,8 @@ func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (
 		return nil, ErrTokenInvalid
 	}
 
-	// 黑名单检查
-	if j.isBlacklisted != nil && c.TokenID != "" && j.isBlacklisted(c.TokenID) {
-		return nil, ErrTokenBlacklisted
+	if err := checkBlacklist(&j.config, c.TokenID); err != nil {
+		return nil, err
 	}
 
 	return c, nil
@@ -132,6 +143,7 @@ func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (
 
 // CachedParseToken 带缓存的 ParseToken，相同 tokenString 不重复解析。
 // 即使缓存命中，仍会检查黑名单。
+// 当调用方传入 ParserOption 时，为避免缓存绕过更严格的校验条件，会直接退化为 ParseToken。
 func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	if j == nil {
 		return nil, ErrJWTNotInit
@@ -139,11 +151,13 @@ func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwtv5.ParserOpt
 	if tokenString == "" {
 		return nil, ErrTokenMalformed
 	}
+	if len(opt) > 0 {
+		return j.ParseToken(tokenString, opt...)
+	}
 
 	if c, ok := loadCachedClaims(&j.cache, tokenString); ok {
-		// 缓存命中后仍需检查黑名单
-		if j.isBlacklisted != nil && c.TokenID != "" && j.isBlacklisted(c.TokenID) {
-			return nil, ErrTokenBlacklisted
+		if err := checkBlacklist(&j.config, c.TokenID); err != nil {
+			return nil, err
 		}
 		return c, nil
 	}
@@ -160,20 +174,9 @@ func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwtv5.ParserOpt
 // ParallelVerify 并发验证多个 token。
 // results[i] 与 errs[i] 对应同一个输入 tokens[i]。
 func (j *JwtEd25519) ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
-	var wg sync.WaitGroup
-	results := make([]*claims.Claims, len(tokens))
-	errs := make([]error, len(tokens))
-
-	for i, token := range tokens {
-		wg.Go(func() {
-			tokenClaims, err := j.ParseToken(token, opt...)
-			results[i] = tokenClaims
-			errs[i] = err
-		})
-	}
-
-	wg.Wait()
-	return results, errs
+	return parallelVerifyClaims(tokens, func(token string) (*claims.Claims, error) {
+		return j.ParseToken(token, opt...)
+	})
 }
 
 // createEd25519Token 使用 EdDSA 签名并返回 token 字符串。

@@ -71,10 +71,25 @@ func WithAudience(audience ...string) Option {
 	}
 }
 
-// WithExpiresAt 设置过期时间（从当前时刻起加上指定时长）。
-func WithExpiresAt(expiresAt time.Duration) Option {
+// WithExpiresIn 设置过期时间（从当前时刻起加上指定时长）。
+func WithExpiresIn(d time.Duration) Option {
 	return func(claims *Claims) {
-		claims.ExpiresAt = jwtv5.NewNumericDate(time.Now().Add(expiresAt))
+		claims.ExpiresAt = jwtv5.NewNumericDate(time.Now().Add(d))
+	}
+}
+
+// WithExpiresAt 设置绝对过期时间。
+//
+// Deprecated: 此函数原接收 time.Duration，语义与命名不一致。
+// 如需设置相对时长，请使用 WithExpiresIn；如需设置绝对时间，请使用 WithExpiresAtTime。
+func WithExpiresAt(d time.Duration) Option {
+	return WithExpiresIn(d)
+}
+
+// WithExpiresAtTime 设置绝对过期时间。
+func WithExpiresAtTime(t time.Time) Option {
+	return func(claims *Claims) {
+		claims.ExpiresAt = jwtv5.NewNumericDate(t)
 	}
 }
 
@@ -110,10 +125,13 @@ func (c Claims) VerifyPrv(prv string) error {
 }
 
 // TTL 返回 token 的剩余有效时间。
-// 如果未设置过期时间则返回 0。
+// 如果未设置过期时间或已过期则返回 0。
 func (c Claims) TTL() time.Duration {
 	if c.ExpiresAt == nil {
 		return 0
 	}
-	return c.ExpiresAt.Sub(time.Now())
+	if d := time.Until(c.ExpiresAt.Time); d > 0 {
+		return d
+	}
+	return 0
 }

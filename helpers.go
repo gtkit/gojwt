@@ -2,6 +2,8 @@ package gojwt
 
 import (
 	"errors"
+	"fmt"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -35,8 +37,20 @@ func normalizeParseError(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, jwtv5.ErrTokenInvalidIssuer):
+		return ErrTokenInvalidIssuer
+	case errors.Is(err, jwtv5.ErrTokenInvalidAudience):
+		return ErrTokenInvalidAudience
+	case errors.Is(err, jwtv5.ErrTokenInvalidSubject):
+		return ErrTokenInvalidSubject
+	case errors.Is(err, jwtv5.ErrTokenInvalidId):
+		return ErrTokenInvalidID
+	case errors.Is(err, jwtv5.ErrTokenRequiredClaimMissing):
+		return ErrTokenRequiredClaimMissing
 	case errors.Is(err, jwtv5.ErrTokenExpired):
 		return ErrTokenExpired
+	case errors.Is(err, jwtv5.ErrTokenUsedBeforeIssued):
+		return ErrTokenUsedBeforeIssued
 	case errors.Is(err, jwtv5.ErrTokenMalformed):
 		return ErrTokenMalformed
 	case errors.Is(err, jwtv5.ErrTokenNotValidYet):
@@ -45,6 +59,8 @@ func normalizeParseError(err error) error {
 		return ErrTokenSignatureInvalid
 	case errors.Is(err, jwtv5.ErrTokenUnverifiable):
 		return ErrTokenUnverifiable
+	case errors.Is(err, jwtv5.ErrTokenInvalidClaims):
+		return ErrTokenInvalidClaims
 	default:
 		return err
 	}
@@ -91,9 +107,10 @@ func storeCachedClaims(cache *claimsCache, token string, tokenClaims *claims.Cla
 	cache.entries.Store(token, entry)
 }
 
-// refreshTokenClaims 检查刷新条件并更新 Claims 的过期时间。
+// refreshTokenClaims 检查刷新条件并轮换 TokenID、更新时间字段。
 // 超过 refreshDuration 返回 ErrTokenExpired，
 // 未进入刷新窗口返回 ErrRefreshTooEarly。
+// 刷新成功后会生成新的 TokenID，并更新 iat、nbf、exp。
 func refreshTokenClaims(tokenClaims *claims.Claims, tokenDuration, refreshDuration time.Duration) error {
 	if tokenClaims == nil || tokenClaims.ExpiresAt == nil || tokenClaims.IssuedAt == nil {
 		return ErrTokenInvalid
@@ -107,7 +124,15 @@ func refreshTokenClaims(tokenClaims *claims.Claims, tokenDuration, refreshDurati
 		return ErrRefreshTooEarly
 	}
 
+	newTokenID, err := generateTokenID()
+	if err != nil {
+		return err
+	}
+
+	tokenClaims.TokenID = newTokenID
 	tokenClaims.ExpiresAt = jwtv5.NewNumericDate(now.Add(tokenDuration))
+	tokenClaims.IssuedAt = jwtv5.NewNumericDate(now)
+	tokenClaims.NotBefore = jwtv5.NewNumericDate(now)
 	return nil
 }
 
@@ -163,4 +188,75 @@ func cloneNumericDate(src *jwtv5.NumericDate) *jwtv5.NumericDate {
 		return nil
 	}
 	return jwtv5.NewNumericDate(src.Time)
+}
+
+// alignTokenIdentifiers 保证业务 TokenID 与标准 jti 始终一致。
+func alignTokenIdentifiers(tokenClaims *claims.Claims, generatedTokenID string) {
+	if tokenClaims == nil {
+		return
+	}
+
+	if tokenClaims.ID != "" && tokenClaims.ID != generatedTokenID {
+		tokenClaims.TokenID = tokenClaims.ID
+	}
+	if tokenClaims.TokenID == "" {
+		tokenClaims.TokenID = generatedTokenID
+	}
+	tokenClaims.ID = tokenClaims.TokenID
+}
+
+// checkBlacklist 根据配置执行黑名单检查。
+func checkBlacklist(cfg *config, tokenID string) error {
+	if cfg == nil || tokenID == "" {
+		return nil
+	}
+
+	if cfg.blacklistCheckFunc != nil {
+		blacklisted, err := cfg.blacklistCheckFunc(tokenID)
+		if err != nil {
+			return fmt.Errorf("check token blacklist: %w", err)
+		}
+		if blacklisted {
+			return ErrTokenBlacklisted
+		}
+		return nil
+	}
+
+	if cfg.isBlacklisted != nil && cfg.isBlacklisted(tokenID) {
+		return ErrTokenBlacklisted
+	}
+
+	return nil
+}
+
+// parallelVerifyClaims 使用有界 worker pool 并发验证多个 token。
+// 结果顺序与输入顺序严格对齐。
+func parallelVerifyClaims(tokens []string, verify func(string) (*claims.Claims, error)) ([]*claims.Claims, []error) {
+	results := make([]*claims.Claims, len(tokens))
+	errs := make([]error, len(tokens))
+	if len(tokens) == 0 {
+		return results, errs
+	}
+
+	workerCount := min(len(tokens), runtime.GOMAXPROCS(0))
+	jobs := make(chan int)
+
+	var wg sync.WaitGroup
+	for range workerCount {
+		wg.Go(func() {
+			for index := range jobs {
+				tokenClaims, err := verify(tokens[index])
+				results[index] = tokenClaims
+				errs[index] = err
+			}
+		})
+	}
+
+	for index := range tokens {
+		jobs <- index
+	}
+	close(jobs)
+
+	wg.Wait()
+	return results, errs
 }

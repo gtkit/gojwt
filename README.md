@@ -1,15 +1,15 @@
 # gojwt
 
-`gojwt` 是一个轻量、直接、面向生产使用的 JWT 工具库，支持以下两种签名方式：
+`gojwt` 是一个轻量、直接、面向生产使用的 JWT 工具库，支持以下两类签名方式：
 
-- `HMAC-SHA256`
+- `HMAC-SHA` 家族：默认 `HS256`，可选 `HS384`、`HS512`
 - `Ed25519`
 
 库中提供了统一的 Token 生成、解析、刷新、缓存解析、并发校验、黑名单等能力，适合在 API 服务、后台服务、网关鉴权和内部 RPC 场景中使用。
 
 ## 特性
 
-- 支持 `HMAC` 与 `Ed25519` 两种算法
+- 支持 `HMAC-SHA` 家族与 `Ed25519`
 - 内置业务 Claims 结构
 - 支持标准字段与业务字段混合签发
 - 支持临近过期时刷新 Token
@@ -85,7 +85,7 @@ type Claims struct {
 - `UserID`：业务用户 ID
 - `Prv`：业务域标识，例如 `admin`、`app`、`open-api`
 - `Roles`：角色集合
-- `TokenID`：唯一 Token ID，创建时自动生成
+- `TokenID`：唯一 Token ID；默认自动生成，并与 JWT 标准字段 `jti` 保持一致
 - `RegisteredClaims`：JWT 标准字段，如 `exp`、`iat`、`nbf`、`iss`、`sub`
 
 ### 默认时长
@@ -94,6 +94,7 @@ type Claims struct {
 
 - `tokenDuration = 2 小时`
 - `refreshDuration = 7 天`
+- `parseLeeway = 5 秒`
 
 可以通过构造时的 Option 修改。
 
@@ -121,17 +122,20 @@ import (
     "fmt"
     "time"
 
+    jwtv5 "github.com/golang-jwt/jwt/v5"
     "github.com/gtkit/gojwt"
     "github.com/gtkit/gojwt/claims"
 )
 
 func main() {
-    // HMAC 密钥至少 32 字节。
-    secret := []byte("12345678901234567890123456789012")
+    // HS512 建议至少使用 64 字节高熵密钥。
+    secret := []byte("1234567890123456789012345678901234567890123456789012345678901234")
 
     // 创建 HMAC JWT 实例。
     j, err := gojwt.NewJwtHmac(
         secret,
+        // HMAC 默认使用 HS256，这里显式切换为 HS512。
+        gojwt.WithHMACSigningMethod(jwtv5.SigningMethodHS512),
         // 设置 access token 有效期。
         gojwt.WithTokenDuration(2*time.Hour),
         // 设置 token 允许刷新的总窗口。
@@ -252,8 +256,9 @@ func NewJwtHmac(secretKey []byte, options ...gojwt.Option) (*gojwt.JwtHmac, erro
 
 说明：
 
-- `secretKey` 至少 `32` 字节
-- 使用 `HS256`
+- 默认使用 `HS256`
+- 可通过 `WithHMACSigningMethod` 切换到 `HS384` / `HS512`
+- `HS256` 至少 `32` 字节，`HS384` 至少 `48` 字节，`HS512` 至少 `64` 字节
 - 密钥只保留在本进程内
 
 示例：
@@ -266,6 +271,33 @@ if err != nil {
 }
 _ = j
 ```
+
+### `WithHMACSigningMethod`
+
+用于为 `JwtHmac` 指定 HMAC 签名算法。
+
+```go
+j, err := gojwt.NewJwtHmac(
+    []byte("123456789012345678901234567890123456789012345678"),
+    gojwt.WithHMACSigningMethod(jwtv5.SigningMethodHS384),
+)
+if err != nil {
+    panic(err)
+}
+_ = j
+```
+
+支持：
+
+- `jwtv5.SigningMethodHS256`
+- `jwtv5.SigningMethodHS384`
+- `jwtv5.SigningMethodHS512`
+
+注意：
+
+- 不传时默认 `HS256`
+- 当前实例只接受与自身配置一致的 HMAC 算法 token
+- `Ed25519` 实例不接受这个 Option
 
 ### `NewJwtEd25519`
 
@@ -314,6 +346,62 @@ if err != nil {
 _ = j
 ```
 
+### `WithParseLeeway`
+
+用于设置 JWT 解析时对时间字段的容忍时间。
+
+```go
+// 将解析时钟漂移容忍时间设为 10 秒。
+j, err := gojwt.NewJwtHmac(
+    []byte("12345678901234567890123456789012"),
+    gojwt.WithParseLeeway(10*time.Second),
+)
+if err != nil {
+    panic(err)
+}
+_ = j
+```
+
+说明：
+
+- 默认值为 `5 秒`
+- 会同时作用于 `exp`、`nbf`、`iat`
+- 如果你希望严格按时间字段校验，可显式传 `gojwt.WithParseLeeway(0)`
+
+### `WithBlacklistCheckFunc`
+
+用于注入可返回错误的黑名单检查函数，适合 Redis、数据库等外部依赖场景。
+
+```go
+j, err := gojwt.NewJwtHmac(
+    []byte("12345678901234567890123456789012"),
+    gojwt.WithBlacklistCheckFunc(func(tokenID string) (bool, error) {
+        n, err := rdb.Exists(ctx, "jwt:blacklist:"+tokenID).Result()
+        return n > 0, err
+    }),
+)
+if err != nil {
+    panic(err)
+}
+_ = j
+```
+
+## HMAC 算法选择
+
+`HS256`、`HS384`、`HS512` 都是对称签名，差别主要在哈希强度、签名长度和密钥长度要求：
+
+| 算法 | 哈希函数 | 签名长度 | 最小密钥长度 | 适用建议 |
+|---|---|---:|---:|---|
+| `HS256` | SHA-256 | 32 字节 | 32 字节 | 默认选择。兼容性最好，性能和安全性平衡最好 |
+| `HS384` | SHA-384 | 48 字节 | 48 字节 | 需要比 `HS256` 更长摘要，但又不想上到 `HS512` 时可选 |
+| `HS512` | SHA-512 | 64 字节 | 64 字节 | 对摘要长度要求更高，且能接受更长密钥与更大 token 时可选 |
+
+实践建议：
+
+- 常规业务默认用 `HS256` 即可
+- 只有当你明确要求更长摘要或与外部系统算法对齐时，再选 `HS384` / `HS512`
+- 不要只改算法不升级密钥长度；算法越强，密钥也应该同步变长
+
 > `Options` 是历史兼容别名，已 deprecated，新代码请使用 `Option`。
 
 ## Claims Option
@@ -328,6 +416,10 @@ _ = j
 - `claims.WithAudience(audience ...string)`
 - `claims.WithExpiresAt(expiresAt time.Duration)`
 - `claims.WithJwtID(jwtID string)`
+
+说明：
+
+- `claims.WithJwtID` 会同时设置标准字段 `jti` 和业务字段 `token_id`
 
 示例：
 
@@ -373,6 +465,8 @@ func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwt.ParserOption) (*c
 
 - 完成验签
 - 校验标准时间字段
+- 默认带 `5 秒` leeway，用于吸收轻微时钟漂移
+- 可通过构造时的 `WithParseLeeway` 修改，或在单次调用中通过 `jwt.ParserOption` 覆盖
 - 返回 `*claims.Claims`
 
 示例：
@@ -399,6 +493,7 @@ func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwt.ParserOptio
 - 首次解析时正常验签并缓存 Claims
 - 再次解析相同 token 时优先命中缓存
 - 返回的是 Claims 副本，避免调用方意外改坏缓存对象
+- 仅在未传入 `ParserOption` 时使用缓存；传入 `issuer`/`audience`/`subject` 等校验选项时会退化为普通解析
 
 注意事项：
 
@@ -456,7 +551,14 @@ func (j *JwtEd25519) ParallelVerify(tokens []string, opt ...jwt.ParserOption) ([
 行为说明：
 
 - 并发验证多个 token
+- 内部使用有界 worker pool，而不是为每个 token 单独起 goroutine
+- 默认最大并发数为 `min(len(tokens), runtime.GOMAXPROCS(0))`
 - `results[i]` 与 `errs[i]` 对应同一个输入 token
+
+注意事项：
+
+- 如果你要处理超大批量 token，仍建议在业务侧分批调用
+- 返回顺序始终与输入顺序一致
 
 示例：
 
@@ -532,14 +634,37 @@ type Blacklister interface {
 }
 ```
 
+`Blacklist` 具体类型还额外提供：
+
+- `NewBlacklistWithCleanup(interval time.Duration) (*Blacklist, error)`
+- `AddToken(tokenClaims *claims.Claims) error`
+- `AddWithExpiration(tokenID string, expiresAt time.Time)`
+- `SweepExpired() int`
+- `Close()`
+
 示例：
 
 ```go
-// 创建黑名单。
-blacklist := gojwt.NewBlacklist()
+// 创建带后台清扫的黑名单。
+blacklist, err := gojwt.NewBlacklistWithCleanup(time.Minute)
+if err != nil {
+    panic(err)
+}
+defer blacklist.Close()
 
-// 用户登出时，将 tokenID 拉黑。
-blacklist.Add("token-id-1")
+// 推荐：按 token 自身 exp 自动失效。
+err = blacklist.AddToken(&claims.Claims{
+    TokenID: "token-id-1",
+    RegisteredClaims: jwtv5.RegisteredClaims{
+        ExpiresAt: jwtv5.NewNumericDate(time.Now().Add(2 * time.Hour)),
+    },
+})
+if err != nil {
+    panic(err)
+}
+
+// 兼容旧用法：永久拉黑，直到手动 Remove。
+blacklist.Add("token-id-2")
 
 // 请求进入时，先检查 token 是否已失效。
 if blacklist.In("token-id-1") {
@@ -553,6 +678,10 @@ blacklist.Remove("token-id-1")
 注意：
 
 - 当前是纯内存实现
+- `AddToken` / `AddWithExpiration` 写入的条目会在到达过期时间后惰性失效
+- 如果使用 `NewBlacklistWithCleanup`，后台会按固定间隔主动清理过期条目
+- `Close()` 应在服务退出时调用，用于停止后台清理协程
+- `Add(tokenID)` 是兼容旧代码的永久拉黑接口
 - 进程重启后数据会丢失
 - 多实例之间不会自动同步
 
@@ -669,12 +798,12 @@ func Refresh(j *gojwt.JwtHmac, oldToken string) (string, error) {
 ### 登出接口示例
 
 ```go
-// 登出时通常不是删除 token，而是将 tokenID 拉黑。
-func Logout(blacklist gojwt.Blacklister, tokenClaims *claims.Claims) {
+// 登出时优先按 token 自身 exp 加入黑名单。
+func Logout(blacklist *gojwt.Blacklist, tokenClaims *claims.Claims) error {
     if blacklist == nil || tokenClaims == nil {
-        return
+        return nil
     }
-    blacklist.Add(tokenClaims.TokenID)
+    return blacklist.AddToken(tokenClaims)
 }
 ```
 
@@ -720,8 +849,14 @@ if err != nil {
 - `ErrTokenMalformed`
 - `ErrTokenUnverifiable`
 - `ErrTokenSignatureInvalid`
+- `ErrTokenRequiredClaimMissing`
+- `ErrTokenInvalidAudience`
 - `ErrTokenExpired`
+- `ErrTokenUsedBeforeIssued`
+- `ErrTokenInvalidIssuer`
+- `ErrTokenInvalidSubject`
 - `ErrTokenNotValidYet`
+- `ErrTokenInvalidClaims`
 - `ErrTokenInvalid`
 - `ErrRefreshTooEarly`
 - `ErrTokenRole`
@@ -822,6 +957,14 @@ if err != nil {
 ### 为什么黑名单不直接内置 Redis
 
 因为库本身希望保持无外部基础设施依赖。Redis 黑名单通常跟业务部署方式强相关，更适合由上层应用自己实现。
+
+### 为什么内存黑名单还保留 `Add(tokenID string)`
+
+这是为了兼容已有调用方。新代码优先使用 `AddToken` 或 `AddWithExpiration`，这样条目会随 token 生命周期自动失效。
+
+### 为什么还需要 `NewBlacklistWithCleanup`
+
+惰性失效只能在调用 `In(tokenID)` 时删除过期条目。长生命周期进程如果写入很多一次性 token、但后续不再查询这些 token，过期条目仍会留在内存里。`NewBlacklistWithCleanup` 提供了一个可选的主动清理机制。
 
 ## 测试
 
