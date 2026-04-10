@@ -5,6 +5,13 @@ import (
 	"github.com/gtkit/gojwt/claims"
 )
 
+// 编译期确保所有实现满足 Tokener 接口。
+var (
+	_ Tokener = (*JwtHmac)(nil)
+	_ Tokener = (*JwtEd25519)(nil)
+	_ Tokener = (*JwtRSA)(nil)
+)
+
 // Tokener 提供算法无关的 JWT 操作接口。
 // JwtHmac 和 JwtEd25519 均实现了此接口，
 // 调用方可面向 Tokener 编程，在 HMAC 与 Ed25519 之间自由切换。

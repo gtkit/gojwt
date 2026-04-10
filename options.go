@@ -26,6 +26,11 @@ type config struct {
 	// 默认使用 HS256，可显式切换到 HS384 / HS512。
 	hmacSigningMethod *jwtv5.SigningMethodHMAC
 	hmacSigningSet    bool
+
+	// rsaSigningMethod 为 JwtRSA 指定签名算法。
+	// 默认使用 RS256，可显式切换到 RS384 / RS512 / PS256 / PS384 / PS512。
+	rsaSigningMethod jwtv5.SigningMethod
+	rsaSigningSet    bool
 }
 
 // Option 配置 JwtHmac / JwtEd25519 实例的选项函数。
@@ -97,6 +102,16 @@ func WithHMACSigningMethod(method *jwtv5.SigningMethodHMAC) Option {
 	return func(c *config) {
 		c.hmacSigningMethod = method
 		c.hmacSigningSet = true
+	}
+}
+
+// WithRSASigningMethod 为 JwtRSA 设置签名算法。
+// 默认使用 RS256，可选 RS384、RS512（PKCS1-v1_5）或 PS256、PS384、PS512（PSS）。
+// PSS 系列更安全，推荐在新项目中使用；RS256 兼容性最好，适合对接第三方 OAuth2/OIDC。
+func WithRSASigningMethod(method jwtv5.SigningMethod) Option {
+	return func(c *config) {
+		c.rsaSigningMethod = method
+		c.rsaSigningSet = true
 	}
 }
 

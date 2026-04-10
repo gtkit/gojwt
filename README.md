@@ -1,15 +1,16 @@
 # gojwt
 
-`gojwt` 是一个轻量、直接、面向生产使用的 JWT 工具库，支持以下两类签名方式：
+`gojwt` 是一个轻量、直接、面向生产使用的 JWT 工具库，支持以下三类签名方式：
 
 - `HMAC-SHA` 家族：默认 `HS256`，可选 `HS384`、`HS512`
-- `Ed25519`
+- `Ed25519` (EdDSA)
+- `RSA` 家族：默认 `RS256`，可选 `RS384`、`RS512`（PKCS1-v1_5）及 `PS256`、`PS384`、`PS512`（PSS）
 
 库中提供了统一的 Token 生成、解析、刷新、缓存解析、并发校验、黑名单等能力，适合在 API 服务、后台服务、网关鉴权和内部 RPC 场景中使用。
 
 ## 特性
 
-- 支持 `HMAC-SHA` 家族与 `Ed25519`
+- 支持 `HMAC-SHA` 家族、`Ed25519` 与 `RSA`（RS/PS 系列）
 - 内置业务 Claims 结构
 - 支持标准字段与业务字段混合签发
 - 支持临近过期时刷新 Token
@@ -34,7 +35,7 @@ go get github.com/gtkit/gojwt
 ### 什么时候适合用这个库
 
 - 你需要在 Go 服务里快速接入 JWT
-- 你希望在 `HMAC` 和 `Ed25519` 之间自由切换
+- 你希望在 `HMAC`、`Ed25519` 和 `RSA` 之间自由切换
 - 你需要对 token 做角色、业务域、过期时间等校验
 - 你需要一个简单直接、没有重型框架依赖的 JWT 封装
 
@@ -56,6 +57,7 @@ gojwt/
 ├── jwt.go            # 密钥工具函数
 ├── jwted25519.go     # Ed25519 实现
 ├── jwthmac.go        # HMAC 实现
+├── jwtrsa.go         # RSA 实现（RS/PS 系列）
 ├── options.go        # 构造 Option
 ├── tokener.go        # 统一接口
 └── claims/
@@ -107,8 +109,9 @@ type Claims struct {
 - token 距离签发时间超过 `refreshDuration`，返回 `ErrTokenExpired`
 - token 距离过期时间仍大于等于 `5 分钟`，返回 `ErrRefreshTooEarly`
 - 只有在离过期不足 `5 分钟` 时，才允许刷新
+- 刷新成功后会生成新的 `TokenID/jti`，并重置 `iat`、`nbf`，旧新 token 可独立吊销
 
-这非常适合 Access Token 的“临期续签”模型。
+这非常适合 Access Token 的”临期续签”模型。
 
 ## 快速开始
 
@@ -246,6 +249,68 @@ func main() {
 }
 ```
 
+### RSA 用法
+
+```go
+package main
+
+import (
+    "fmt"
+    "path/filepath"
+
+    jwtv5 "github.com/golang-jwt/jwt/v5"
+    "github.com/gtkit/gojwt"
+    "github.com/gtkit/gojwt/claims"
+)
+
+func main() {
+    // 定义密钥文件路径。
+    priPath := filepath.Join("cert", "jwt_rsa.pem")
+    pubPath := filepath.Join("cert", "jwt_rsa.pub.pem")
+
+    // 首次部署时生成 RSA 密钥对（2048 bit，适用于 RS256/PS256）。
+    if err := gojwt.GenerateRSAKeys(priPath, pubPath, 2048); err != nil {
+        panic(err)
+    }
+
+    // 从 PEM 文件加载密钥对，默认 RS256。
+    j, err := gojwt.NewJwtRSA(priPath, pubPath)
+    if err != nil {
+        panic(err)
+    }
+
+    // 签发 token。
+    token, err := j.GenerateToken(
+        30001,
+        claims.WithPrv("gateway"),
+        claims.WithRoles("service"),
+        claims.WithIssuer("auth-center"),
+    )
+    if err != nil {
+        panic(err)
+    }
+
+    // 解析并验签。
+    tokenClaims, err := j.ParseToken(token)
+    if err != nil {
+        panic(err)
+    }
+
+    fmt.Println("uid:", tokenClaims.UserID)
+    fmt.Println("issuer:", tokenClaims.Issuer)
+
+    // 如果需要 PSS（更安全），可以在创建时指定。
+    // jPSS, _ := gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithRSASigningMethod(jwtv5.SigningMethodPS256))
+    _ = jwtv5.SigningMethodPS256 // 示例引用
+}
+```
+
+也可以直接从内存密钥创建（适用于 KMS、Vault 等场景）：
+
+```go
+j, err := gojwt.NewJwtRSAFromKeys(privateKey, &privateKey.PublicKey)
+```
+
 ## 构造函数
 
 ### `NewJwtHmac`
@@ -297,7 +362,30 @@ _ = j
 
 - 不传时默认 `HS256`
 - 当前实例只接受与自身配置一致的 HMAC 算法 token
-- `Ed25519` 实例不接受这个 Option
+- `Ed25519` / `RSA` 实例不接受这个 Option
+
+### `WithRSASigningMethod`
+
+用于为 `JwtRSA` 指定签名算法。
+
+```go
+j, err := gojwt.NewJwtRSA(
+    priPath, pubPath,
+    gojwt.WithRSASigningMethod(jwtv5.SigningMethodPS256),
+)
+```
+
+支持：
+
+| 系列 | 算法 | 说明 |
+|------|------|------|
+| PKCS1-v1_5 | `RS256` / `RS384` / `RS512` | 兼容性最好，OAuth2/OIDC 默认 |
+| PSS | `PS256` / `PS384` / `PS512` | 更安全，推荐新项目使用 |
+
+注意：
+
+- 不传时默认 `RS256`
+- `HMAC` / `Ed25519` 实例不接受这个 Option
 
 ### `NewJwtEd25519`
 
@@ -311,6 +399,38 @@ func NewJwtEd25519(priPath, pubPath string, options ...gojwt.Option) (*gojwt.Jwt
 - 私钥负责签名
 - 公钥负责验签
 - 更适合多服务共享公钥的场景
+
+### `NewJwtRSA`
+
+```go
+func NewJwtRSA(priPath, pubPath string, options ...gojwt.Option) (*gojwt.JwtRSA, error)
+```
+
+说明：
+
+- 从 PEM 文件加载 RSA 密钥对
+- 支持 PKCS1（`RSA PRIVATE KEY`）和 PKCS8（`PRIVATE KEY`）格式
+- 默认使用 `RS256`
+- 可通过 `WithRSASigningMethod` 切换到 `RS384` / `RS512` / `PS256` / `PS384` / `PS512`
+- 密钥长度要求：`RS256/PS256` 至少 `2048` bit，`RS384/PS384` 至少 `3072` bit，`RS512/PS512` 至少 `4096` bit
+
+示例：
+
+```go
+j, err := gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithRSASigningMethod(jwtv5.SigningMethodPS256))
+```
+
+### `NewJwtRSAFromKeys`
+
+```go
+func NewJwtRSAFromKeys(privateKey *rsa.PrivateKey, publicKey *rsa.PublicKey, options ...gojwt.Option) (*gojwt.JwtRSA, error)
+```
+
+说明：
+
+- 直接使用内存中的 RSA 密钥对创建实例
+- 适用于密钥来自 KMS、Vault、环境变量等外部系统
+- 其余行为与 `NewJwtRSA` 一致
 
 ## 构造 Option
 
@@ -414,12 +534,14 @@ _ = j
 - `claims.WithIssuer(issuer string)`
 - `claims.WithSubject(subject string)`
 - `claims.WithAudience(audience ...string)`
-- `claims.WithExpiresAt(expiresAt time.Duration)`
+- `claims.WithExpiresIn(d time.Duration)` — 设置相对过期时长
+- `claims.WithExpiresAtTime(t time.Time)` — 设置绝对过期时间
 - `claims.WithJwtID(jwtID string)`
 
 说明：
 
 - `claims.WithJwtID` 会同时设置标准字段 `jti` 和业务字段 `token_id`
+- `claims.WithExpiresAt` 仍可用，但已 deprecated，请迁移到 `WithExpiresIn`
 
 示例：
 
@@ -446,6 +568,7 @@ _ = token
 ```go
 func (j *JwtHmac) GenerateToken(uid int64, options ...claims.Option) (string, error)
 func (j *JwtEd25519) GenerateToken(uid int64, options ...claims.Option) (string, error)
+func (j *JwtRSA) GenerateToken(uid int64, options ...claims.Option) (string, error)
 ```
 
 行为说明：
@@ -459,6 +582,7 @@ func (j *JwtEd25519) GenerateToken(uid int64, options ...claims.Option) (string,
 ```go
 func (j *JwtHmac) ParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
+func (j *JwtRSA) ParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 ```
 
 行为说明：
@@ -486,6 +610,7 @@ fmt.Println("uid:", tokenClaims.UserID)
 ```go
 func (j *JwtHmac) CachedParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
+func (j *JwtRSA) CachedParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 ```
 
 行为说明：
@@ -518,13 +643,15 @@ fmt.Println("token id:", tokenClaims.TokenID)
 ```go
 func (j *JwtHmac) RefreshToken(tokenString string, opt ...jwt.ParserOption) (string, error)
 func (j *JwtEd25519) RefreshToken(tokenString string, opt ...jwt.ParserOption) (string, error)
+func (j *JwtRSA) RefreshToken(tokenString string, opt ...jwt.ParserOption) (string, error)
 ```
 
 行为说明：
 
 - 使用旧 token 中的 Claims 重新签发新 token
 - 保留原业务字段
-- 重新计算新的过期时间
+- 生成新的 `TokenID/jti`，重置 `iat`、`nbf`、`exp`
+- 旧 token 与新 token 可独立吊销
 
 示例：
 
@@ -546,6 +673,7 @@ _ = newToken
 ```go
 func (j *JwtHmac) ParallelVerify(tokens []string, opt ...jwt.ParserOption) ([]*claims.Claims, []error)
 func (j *JwtEd25519) ParallelVerify(tokens []string, opt ...jwt.ParserOption) ([]*claims.Claims, []error)
+func (j *JwtRSA) ParallelVerify(tokens []string, opt ...jwt.ParserOption) ([]*claims.Claims, []error)
 ```
 
 行为说明：
@@ -615,7 +743,7 @@ import (
 )
 
 func IssueToken(t gojwt.Tokener, uid int64) (string, error) {
-    // 调用方不用关心底层是 HMAC 还是 Ed25519。
+    // 调用方不用关心底层是 HMAC、Ed25519 还是 RSA。
     return t.GenerateToken(uid, claims.WithPrv("admin"))
 }
 ```
@@ -634,13 +762,22 @@ type Blacklister interface {
 }
 ```
 
-`Blacklist` 具体类型还额外提供：
+增强接口 `BlacklistManager`（`*Blacklist` 同时实现了两个接口）：
 
+```go
+type BlacklistManager interface {
+    Blacklister
+    AddWithExpiration(tokenID string, expiresAt time.Time)
+    AddToken(tokenClaims *claims.Claims) error
+    SweepExpired() int
+    Close()
+}
+```
+
+工厂函数：
+
+- `NewBlacklist() *Blacklist`
 - `NewBlacklistWithCleanup(interval time.Duration) (*Blacklist, error)`
-- `AddToken(tokenClaims *claims.Claims) error`
-- `AddWithExpiration(tokenID string, expiresAt time.Time)`
-- `SweepExpired() int`
-- `Close()`
 
 示例：
 
@@ -841,6 +978,22 @@ if err != nil {
 }
 ```
 
+### 生成 RSA 密钥对
+
+```go
+// 生成 2048 bit RSA 密钥对（适用于 RS256/PS256）。
+err := gojwt.GenerateRSAKeys("./cert/rsa.pem", "./cert/rsa.pub.pem", 2048)
+if err != nil {
+    panic(err)
+}
+
+// 生成 4096 bit RSA 密钥对（适用于 RS512/PS512）。
+err = gojwt.GenerateRSAKeys("./cert/rsa4096.pem", "./cert/rsa4096.pub.pem", 4096)
+if err != nil {
+    panic(err)
+}
+```
+
 ## 错误处理
 
 常见错误包括：
@@ -879,9 +1032,9 @@ if err != nil {
 }
 ```
 
-## HMAC 与 Ed25519 如何选择
+## 算法如何选择
 
-### 选择 HMAC
+### 选择 HMAC（HS256 / HS384 / HS512）
 
 适合：
 
@@ -902,11 +1055,41 @@ if err != nil {
 - 多服务验签
 - 只有少数服务具备签发权限
 - 希望安全边界更清晰
+- 对性能要求高
 
 优点：
 
 - 公私钥职责分离
-- 可以把公钥分发到多个只读验证服务
+- 签名验签速度最快的非对称算法
+- 密钥短（32 字节）
+
+### 选择 RSA（RS256 / PS256 等）
+
+适合：
+
+- 需要对接第三方 OAuth2 / OIDC 系统（RS256 是事实标准）
+- 与 AWS Cognito、Auth0、Firebase 等云服务集成
+- 需要 NIST 合规的场景
+
+优点：
+
+- 生态兼容性最好，几乎所有 IdP 都支持
+- PSS 系列比 PKCS1-v1_5 更安全
+- 公私钥职责分离
+
+注意：
+
+- 密钥较长（2048-4096 bit），签名验签比 Ed25519 慢
+- 新项目如无兼容性要求，优先考虑 Ed25519
+
+### 快速选型
+
+| 场景 | 推荐 |
+|------|------|
+| 单体服务、简单鉴权 | HMAC（HS256） |
+| 微服务、签发/验证分离、高性能 | Ed25519 |
+| 对接第三方 OAuth2/OIDC | RSA（RS256） |
+| 新项目、更安全的 RSA | RSA（PS256） |
 
 ## 最佳实践
 
@@ -981,6 +1164,7 @@ go test ./...
 - `claims.Option` 是当前推荐命名
 - `claims.Options` 仍可用，但已 deprecated
 - `GenerateSecureKey()` 仍可用，但已 deprecated，请迁移到 `GenerateSecureKeyString()`
+- `claims.WithExpiresAt()` 仍可用，但已 deprecated，请迁移到 `claims.WithExpiresIn()` 或 `claims.WithExpiresAtTime()`
 
 ## License
 
