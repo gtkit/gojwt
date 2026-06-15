@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"time"
 
 	jwtv5 "github.com/golang-jwt/jwt/v5"
 	"github.com/gtkit/gojwt/claims"
@@ -44,7 +43,7 @@ func NewJwtEd25519(priPath, pubPath string, options ...Option) (*JwtEd25519, err
 	if err := validateConfig(j.config); err != nil {
 		return nil, err
 	}
-	if j.config.hmacSigningSet {
+	if j.hmacSigningSet {
 		return nil, fmt.Errorf("%w: HMAC signing method option is not applicable to Ed25519", ErrInvalidConfig)
 	}
 
@@ -58,29 +57,9 @@ func (j *JwtEd25519) GenerateToken(uid int64, options ...claims.Option) (string,
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	tokenID, err := generateTokenID()
-	if err != nil {
-		return "", err
-	}
-
-	now := time.Now()
-	tokenClaims := &claims.Claims{
-		UserID:  uid,
-		TokenID: tokenID,
-		RegisteredClaims: jwtv5.RegisteredClaims{
-			ExpiresAt: jwtv5.NewNumericDate(now.Add(j.tokenDuration)),
-			NotBefore: jwtv5.NewNumericDate(now),
-			IssuedAt:  jwtv5.NewNumericDate(now),
-			ID:        tokenID,
-		},
-	}
-
-	for _, opt := range options {
-		opt(tokenClaims)
-	}
-	alignTokenIdentifiers(tokenClaims, tokenID)
-
-	return createEd25519Token(*tokenClaims, j.privateKey)
+	return generateTokenImpl(&j.config, uid, options, func(cc *claims.Claims) (string, error) {
+		return createEd25519Token(*cc, j.privateKey)
+	})
 }
 
 // RefreshToken 在刷新窗口内刷新 JWT token。
@@ -91,17 +70,9 @@ func (j *JwtEd25519) RefreshToken(tokenString string, opt ...jwtv5.ParserOption)
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	tokenClaims, err := j.ParseToken(tokenString, opt...)
-	if err != nil {
-		return "", err
-	}
-
-	if err := refreshTokenClaims(tokenClaims, j.tokenDuration, j.refreshDuration); err != nil {
-		return "", err
-	}
-
-	tokenClaims.RegisteredClaims.ID = tokenClaims.TokenID
-	return createEd25519Token(*tokenClaims, j.privateKey)
+	return refreshTokenImpl(&j.config, tokenString, opt, j.ParseToken, func(cc *claims.Claims) (string, error) {
+		return createEd25519Token(*cc, j.privateKey)
+	})
 }
 
 // ParseToken 解析并验证 JWT token。
@@ -112,33 +83,9 @@ func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (
 	if j == nil {
 		return nil, ErrJWTNotInit
 	}
-	if tokenString == "" {
-		return nil, ErrTokenMalformed
-	}
-	parserOptions := append([]jwtv5.ParserOption{
-		jwtv5.WithValidMethods([]string{jwtv5.SigningMethodEdDSA.Alg()}),
-		jwtv5.WithLeeway(j.parseLeeway),
-	}, opt...)
-	token, err := jwtv5.ParseWithClaims(tokenString, &claims.Claims{}, func(token *jwtv5.Token) (any, error) {
-		if token.Method == nil || token.Method.Alg() != jwtv5.SigningMethodEdDSA.Alg() {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
+	return parseTokenImpl(&j.config, tokenString, opt, func(_ *jwtv5.Token) (any, error) {
 		return j.publicKey, nil
-	}, parserOptions...)
-	if err != nil {
-		return nil, normalizeParseError(err)
-	}
-
-	c, ok := token.Claims.(*claims.Claims)
-	if !ok || !token.Valid {
-		return nil, ErrTokenInvalid
-	}
-
-	if err := checkBlacklist(&j.config, c.TokenID); err != nil {
-		return nil, err
-	}
-
-	return c, nil
+	}, jwtv5.SigningMethodEdDSA.Alg())
 }
 
 // CachedParseToken 带缓存的 ParseToken，相同 tokenString 不重复解析。
@@ -148,35 +95,16 @@ func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwtv5.ParserOpt
 	if j == nil {
 		return nil, ErrJWTNotInit
 	}
-	if tokenString == "" {
-		return nil, ErrTokenMalformed
-	}
-	if len(opt) > 0 {
-		return j.ParseToken(tokenString, opt...)
-	}
-
-	if c, ok := loadCachedClaims(&j.cache, tokenString); ok {
-		if err := checkBlacklist(&j.config, c.TokenID); err != nil {
-			return nil, err
-		}
-		return c, nil
-	}
-
-	tokenClaims, err := j.ParseToken(tokenString, opt...)
-	if err != nil {
-		return nil, err
-	}
-
-	storeCachedClaims(&j.cache, tokenString, tokenClaims)
-	return tokenClaims, nil
+	return cachedParseTokenImpl(&j.config, &j.cache, tokenString, opt, j.ParseToken)
 }
 
 // ParallelVerify 并发验证多个 token。
 // results[i] 与 errs[i] 对应同一个输入 tokens[i]。
 func (j *JwtEd25519) ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
-	return parallelVerifyClaims(tokens, func(token string) (*claims.Claims, error) {
-		return j.ParseToken(token, opt...)
-	})
+	if j == nil {
+		return nil, nil
+	}
+	return parallelVerifyImpl(tokens, opt, j.ParseToken)
 }
 
 // createEd25519Token 使用 EdDSA 签名并返回 token 字符串。

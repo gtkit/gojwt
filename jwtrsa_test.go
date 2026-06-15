@@ -292,6 +292,10 @@ func TestJwtRSANilReceiverSafety(t *testing.T) {
 
 	_, err = j.CachedParseToken("token")
 	require.ErrorIs(t, err, gojwt.ErrJWTNotInit)
+
+	results, errs := j.ParallelVerify([]string{"token"})
+	require.Nil(t, results)
+	require.Nil(t, errs)
 }
 
 // ---------- Tokener interface ----------

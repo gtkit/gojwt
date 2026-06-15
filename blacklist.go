@@ -88,11 +88,12 @@ func (b *Blacklist) In(tokenID string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	now := time.Now()
 	expiresAt, ok = b.m[tokenID]
 	if !ok {
 		return false
 	}
-	if expiresAt.IsZero() || time.Now().Before(expiresAt) {
+	if expiresAt.IsZero() || now.Before(expiresAt) {
 		return true
 	}
 

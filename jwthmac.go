@@ -2,7 +2,6 @@ package gojwt
 
 import (
 	"fmt"
-	"time"
 
 	jwtv5 "github.com/golang-jwt/jwt/v5"
 	"github.com/gtkit/gojwt/claims"
@@ -30,7 +29,7 @@ func NewJwtHmac(secretKey []byte, options ...Option) (*JwtHmac, error) {
 	if err := validateConfig(j.config); err != nil {
 		return nil, err
 	}
-	signingMethod, err := resolveHMACSigningMethod(j.config.hmacSigningMethod, j.config.hmacSigningSet)
+	signingMethod, err := resolveHMACSigningMethod(j.hmacSigningMethod, j.hmacSigningSet)
 	if err != nil {
 		return nil, err
 	}
@@ -49,29 +48,9 @@ func (j *JwtHmac) GenerateToken(uid int64, options ...claims.Option) (string, er
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	tokenID, err := generateTokenID()
-	if err != nil {
-		return "", err
-	}
-
-	now := time.Now()
-	tokenClaims := &claims.Claims{
-		UserID:  uid,
-		TokenID: tokenID,
-		RegisteredClaims: jwtv5.RegisteredClaims{
-			ExpiresAt: jwtv5.NewNumericDate(now.Add(j.tokenDuration)),
-			NotBefore: jwtv5.NewNumericDate(now),
-			IssuedAt:  jwtv5.NewNumericDate(now),
-			ID:        tokenID,
-		},
-	}
-
-	for _, opt := range options {
-		opt(tokenClaims)
-	}
-	alignTokenIdentifiers(tokenClaims, tokenID)
-
-	return createHmacToken(*tokenClaims, j.secretKey, j.hmacSigningMethod())
+	return generateTokenImpl(&j.config, uid, options, func(cc *claims.Claims) (string, error) {
+		return createHmacToken(*cc, j.secretKey, j.signingMethod)
+	})
 }
 
 // RefreshToken 在刷新窗口内刷新 JWT token。
@@ -82,17 +61,9 @@ func (j *JwtHmac) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (s
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	tokenClaims, err := j.ParseToken(tokenString, opt...)
-	if err != nil {
-		return "", err
-	}
-
-	if err := refreshTokenClaims(tokenClaims, j.tokenDuration, j.refreshDuration); err != nil {
-		return "", err
-	}
-
-	tokenClaims.RegisteredClaims.ID = tokenClaims.TokenID
-	return createHmacToken(*tokenClaims, j.secretKey, j.hmacSigningMethod())
+	return refreshTokenImpl(&j.config, tokenString, opt, j.ParseToken, func(cc *claims.Claims) (string, error) {
+		return createHmacToken(*cc, j.secretKey, j.signingMethod)
+	})
 }
 
 // ParseToken 解析并验证 JWT token。
@@ -103,35 +74,9 @@ func (j *JwtHmac) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (*cl
 	if j == nil {
 		return nil, ErrJWTNotInit
 	}
-	if tokenString == "" {
-		return nil, ErrTokenMalformed
-	}
-	signingMethod := j.hmacSigningMethod()
-	parserOptions := append([]jwtv5.ParserOption{
-		jwtv5.WithValidMethods([]string{signingMethod.Alg()}),
-		jwtv5.WithLeeway(j.parseLeeway),
-	}, opt...)
-	token, err := jwtv5.ParseWithClaims(tokenString, &claims.Claims{}, func(token *jwtv5.Token) (any, error) {
-		if token.Method == nil || token.Method.Alg() != signingMethod.Alg() {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-
+	return parseTokenImpl(&j.config, tokenString, opt, func(_ *jwtv5.Token) (any, error) {
 		return j.secretKey, nil
-	}, parserOptions...)
-	if err != nil {
-		return nil, normalizeParseError(err)
-	}
-
-	c, ok := token.Claims.(*claims.Claims)
-	if !ok || !token.Valid {
-		return nil, ErrTokenInvalid
-	}
-
-	if err := checkBlacklist(&j.config, c.TokenID); err != nil {
-		return nil, err
-	}
-
-	return c, nil
+	}, j.signingMethod.Alg())
 }
 
 // CachedParseToken 带缓存的 ParseToken，相同 tokenString 不重复解析。
@@ -142,47 +87,21 @@ func (j *JwtHmac) CachedParseToken(tokenString string, opt ...jwtv5.ParserOption
 	if j == nil {
 		return nil, ErrJWTNotInit
 	}
-	if tokenString == "" {
-		return nil, ErrTokenMalformed
-	}
-	if len(opt) > 0 {
-		return j.ParseToken(tokenString, opt...)
-	}
-
-	if c, ok := loadCachedClaims(&j.cache, tokenString); ok {
-		if err := checkBlacklist(&j.config, c.TokenID); err != nil {
-			return nil, err
-		}
-		return c, nil
-	}
-
-	tokenClaims, err := j.ParseToken(tokenString, opt...)
-	if err != nil {
-		return nil, err
-	}
-
-	storeCachedClaims(&j.cache, tokenString, tokenClaims)
-	return tokenClaims, nil
+	return cachedParseTokenImpl(&j.config, &j.cache, tokenString, opt, j.ParseToken)
 }
 
 // ParallelVerify 并发验证多个 token。
 // results[i] 与 errs[i] 对应同一个输入 tokens[i]。
 func (j *JwtHmac) ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
-	return parallelVerifyClaims(tokens, func(token string) (*claims.Claims, error) {
-		return j.ParseToken(token, opt...)
-	})
+	if j == nil {
+		return nil, nil
+	}
+	return parallelVerifyImpl(tokens, opt, j.ParseToken)
 }
 
 // createHmacToken 使用指定的 HMAC-SHA 签名算法并返回 token 字符串。
 func createHmacToken(claims claims.Claims, signKey any, signingMethod *jwtv5.SigningMethodHMAC) (string, error) {
 	return jwtv5.NewWithClaims(signingMethod, claims).SignedString(signKey)
-}
-
-func (j *JwtHmac) hmacSigningMethod() *jwtv5.SigningMethodHMAC {
-	if j != nil && j.signingMethod != nil {
-		return j.signingMethod
-	}
-	return jwtv5.SigningMethodHS256
 }
 
 func resolveHMACSigningMethod(method *jwtv5.SigningMethodHMAC, configured bool) (*jwtv5.SigningMethodHMAC, error) {

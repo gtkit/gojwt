@@ -1019,6 +1019,10 @@ func TestJwtHmacNilReceiverSafety(t *testing.T) {
 
 	_, err = j.CachedParseToken("token")
 	require.ErrorIs(t, err, gojwt.ErrJWTNotInit)
+
+	results, errs := j.ParallelVerify([]string{"token"})
+	require.Nil(t, results)
+	require.Nil(t, errs)
 }
 
 func TestJwtEd25519NilReceiverSafety(t *testing.T) {
@@ -1035,4 +1039,8 @@ func TestJwtEd25519NilReceiverSafety(t *testing.T) {
 
 	_, err = j.CachedParseToken("token")
 	require.ErrorIs(t, err, gojwt.ErrJWTNotInit)
+
+	results, errs := j.ParallelVerify([]string{"token"})
+	require.Nil(t, results)
+	require.Nil(t, errs)
 }

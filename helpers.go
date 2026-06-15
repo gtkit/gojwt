@@ -69,7 +69,8 @@ func normalizeParseError(err error) error {
 // loadCachedClaims 从缓存中加载 Claims。
 // 命中时返回深拷贝副本，过期条目会被自动删除。
 func loadCachedClaims(cache *claimsCache, token string) (*claims.Claims, bool) {
-	cache.maybeSweepExpired(time.Now())
+	now := time.Now()
+	cache.maybeSweepExpired(now)
 
 	value, ok := cache.entries.Load(token)
 	if !ok {
@@ -82,7 +83,7 @@ func loadCachedClaims(cache *claimsCache, token string) (*claims.Claims, bool) {
 		return nil, false
 	}
 
-	if !entry.expiresAt.IsZero() && !time.Now().Before(entry.expiresAt) {
+	if !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt) {
 		cache.entries.Delete(token)
 		return nil, false
 	}
@@ -144,7 +145,7 @@ func (c *claimsCache) maybeSweepExpired(now time.Time) {
 	}
 
 	last := c.lastSweep.Load()
-	if last != 0 && now.Sub(time.Unix(0, last)) < cacheSweepInterval {
+	if last != 0 && now.UnixNano()-last < int64(cacheSweepInterval) {
 		return
 	}
 	if !c.lastSweep.CompareAndSwap(last, now.UnixNano()) {
@@ -259,4 +260,116 @@ func parallelVerifyClaims(tokens []string, verify func(string) (*claims.Claims, 
 
 	wg.Wait()
 	return results, errs
+}
+
+// ----------------------- 通用 JWT 操作方法 -----------------------
+// 以下函数消除了 JwtHmac / JwtEd25519 / JwtRSA 之间的重复代码。
+
+// generateTokenImpl 是 GenerateToken 的通用实现。
+// cfg 来自具体实例的 config，signFn 由具体实现提供（签名方式不同）。
+func generateTokenImpl(cfg *config, uid int64, options []claims.Option, signFn func(*claims.Claims) (string, error)) (string, error) {
+	tokenID, err := generateTokenID()
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now()
+	tokenClaims := &claims.Claims{
+		UserID:  uid,
+		TokenID: tokenID,
+		RegisteredClaims: jwtv5.RegisteredClaims{
+			ExpiresAt: jwtv5.NewNumericDate(now.Add(cfg.tokenDuration)),
+			NotBefore: jwtv5.NewNumericDate(now),
+			IssuedAt:  jwtv5.NewNumericDate(now),
+			ID:        tokenID,
+		},
+	}
+
+	for _, opt := range options {
+		opt(tokenClaims)
+	}
+	alignTokenIdentifiers(tokenClaims, tokenID)
+
+	return signFn(tokenClaims)
+}
+
+// parseTokenImpl 是 ParseToken 的通用实现。
+// cfg 提供 parseLeeway，keyFunc 由具体实现提供（获取验签密钥并验证算法）。
+func parseTokenImpl(cfg *config, tokenString string, opt []jwtv5.ParserOption, keyFunc func(*jwtv5.Token) (any, error), expectedAlg string) (*claims.Claims, error) {
+	if tokenString == "" {
+		return nil, ErrTokenMalformed
+	}
+	parserOptions := append([]jwtv5.ParserOption{
+		jwtv5.WithValidMethods([]string{expectedAlg}),
+		jwtv5.WithLeeway(cfg.parseLeeway),
+	}, opt...)
+	token, err := jwtv5.ParseWithClaims(tokenString, &claims.Claims{}, func(token *jwtv5.Token) (any, error) {
+		if token.Method == nil || token.Method.Alg() != expectedAlg {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return keyFunc(token)
+	}, parserOptions...)
+	if err != nil {
+		return nil, normalizeParseError(err)
+	}
+
+	c, ok := token.Claims.(*claims.Claims)
+	if !ok || !token.Valid {
+		return nil, ErrTokenInvalid
+	}
+
+	if err := checkBlacklist(cfg, c.TokenID); err != nil {
+		return nil, err
+	}
+
+	return c, nil
+}
+
+// refreshTokenImpl 是 RefreshToken 的通用实现。
+// parseFn 和 signFn 由具体实现提供。
+func refreshTokenImpl(cfg *config, tokenString string, opt []jwtv5.ParserOption, parseFn func(string, ...jwtv5.ParserOption) (*claims.Claims, error), signFn func(*claims.Claims) (string, error)) (string, error) {
+	tokenClaims, err := parseFn(tokenString, opt...)
+	if err != nil {
+		return "", err
+	}
+
+	if err := refreshTokenClaims(tokenClaims, cfg.tokenDuration, cfg.refreshDuration); err != nil {
+		return "", err
+	}
+
+	tokenClaims.ID = tokenClaims.TokenID
+	return signFn(tokenClaims)
+}
+
+// cachedParseTokenImpl 是 CachedParseToken 的通用实现。
+// parseFn 由具体实现提供，通常指向具体类型的 ParseToken。
+func cachedParseTokenImpl(cfg *config, cache *claimsCache, tokenString string, opt []jwtv5.ParserOption, parseFn func(string, ...jwtv5.ParserOption) (*claims.Claims, error)) (*claims.Claims, error) {
+	if tokenString == "" {
+		return nil, ErrTokenMalformed
+	}
+	if len(opt) > 0 {
+		return parseFn(tokenString, opt...)
+	}
+
+	if c, ok := loadCachedClaims(cache, tokenString); ok {
+		if err := checkBlacklist(cfg, c.TokenID); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+
+	tokenClaims, err := parseFn(tokenString, opt...)
+	if err != nil {
+		return nil, err
+	}
+
+	storeCachedClaims(cache, tokenString, tokenClaims)
+	return tokenClaims, nil
+}
+
+// parallelVerifyImpl 是 ParallelVerify 的通用实现。
+func parallelVerifyImpl(tokens []string, opt []jwtv5.ParserOption, parseFn func(string, ...jwtv5.ParserOption) (*claims.Claims, error)) ([]*claims.Claims, []error) {
+	return parallelVerifyClaims(tokens, func(token string) (*claims.Claims, error) {
+		return parseFn(token, opt...)
+	})
 }
