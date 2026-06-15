@@ -23,11 +23,12 @@ gojwt 把这些「反复要做但又不是业务核心」的事情全部标准�
 
 # 核心能力
 
-- GenerateToken / ParseToken：基础签发与验签
-- RefreshToken：临期续签，自动轮换 TokenID
-- CachedParseToken：带缓存的解析，减少重复验签开销
-- ParallelVerify：有界 worker pool 并发验签
+- GenerateToken / ParseToken / ParseTokenContext：基础签发与验签
+- RefreshToken / RefreshTokenContext：临期续签，自动轮换 TokenID
+- CachedParseToken / CachedParseTokenContext：带缓存的解析，减少重复验签开销
+- ParallelVerify / ParallelVerifyContext：有界 worker pool 并发验签
 - Blacklist / BlacklistManager：并发安全的内存黑名单，支持带过期时间
+- WithBlacklistCheckFunc / WithBlacklistCheckContextFunc：接入外部黑名单存储
 - Tokener：统一接口，面向接口编程可无缝切换算法
 
 # 设计原则
@@ -35,7 +36,8 @@ gojwt 把这些「反复要做但又不是业务核心」的事情全部标准�
 - 零外部基础设施依赖（不依赖 Redis、DB）
 - Functional Options 配置模式
 - 所有错误都是 sentinel error，统一用 errors.Is 判断
-- 内部使用 sync.Map + atomic + RWMutex 确保并发安全
+- 内部使用 mutex、LRU map 和 RWMutex 确保并发安全
 - Claims 深拷贝，防止外部意外篡改缓存
+- 缓存默认最多 4096 条，按 LRU 淘汰，可通过 WithCacheMaxEntries 调整
 */
 package gojwt

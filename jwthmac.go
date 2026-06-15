@@ -1,6 +1,7 @@
 package gojwt
 
 import (
+	"context"
 	"fmt"
 
 	jwtv5 "github.com/golang-jwt/jwt/v5"
@@ -9,6 +10,7 @@ import (
 
 // JwtHmac 基于 HMAC-SHA 家族签名的 JWT 实例。
 // 默认使用 HS256，可通过 Option 切换到 HS384 / HS512。
+// JwtHmac 可被多个 goroutine 并发使用。
 type JwtHmac struct {
 	secretKey     []byte
 	signingMethod *jwtv5.SigningMethodHMAC
@@ -19,15 +21,14 @@ type JwtHmac struct {
 // NewJwtHmac 创建 HMAC JWT 实例。
 // 默认使用 HS256，可通过 WithHMACSigningMethod 切换到 HS384 / HS512。
 func NewJwtHmac(secretKey []byte, options ...Option) (*JwtHmac, error) {
+	cfg, err := newConfig(options...)
+	if err != nil {
+		return nil, err
+	}
+
 	j := &JwtHmac{
 		secretKey: append([]byte(nil), secretKey...),
-		config:    defaultConfig(),
-	}
-	for _, opt := range options {
-		opt(&j.config)
-	}
-	if err := validateConfig(j.config); err != nil {
-		return nil, err
+		config:    cfg,
 	}
 	signingMethod, err := resolveHMACSigningMethod(j.hmacSigningMethod, j.hmacSigningSet)
 	if err != nil {
@@ -61,7 +62,17 @@ func (j *JwtHmac) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (s
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	return refreshTokenImpl(&j.config, tokenString, opt, j.ParseToken, func(cc *claims.Claims) (string, error) {
+	return refreshTokenImplContext(context.Background(), &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
+		return createHmacToken(*cc, j.secretKey, j.signingMethod)
+	})
+}
+
+// RefreshTokenContext 在刷新窗口内刷新 JWT token，并尊重 ctx 取消和 deadline。
+func (j *JwtHmac) RefreshTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (string, error) {
+	if j == nil {
+		return "", ErrJWTNotInit
+	}
+	return refreshTokenImplContext(ctx, &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
 		return createHmacToken(*cc, j.secretKey, j.signingMethod)
 	})
 }
@@ -71,10 +82,15 @@ func (j *JwtHmac) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (s
 // 如果通过 WithBlacklistFunc 配置了黑名单检查函数，
 // 解析成功后会自动检查 tokenID 是否被拉黑。
 func (j *JwtHmac) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
+	return j.ParseTokenContext(context.Background(), tokenString, opt...)
+}
+
+// ParseTokenContext 解析并验证 JWT token，并尊重 ctx 取消和 deadline。
+func (j *JwtHmac) ParseTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	if j == nil {
 		return nil, ErrJWTNotInit
 	}
-	return parseTokenImpl(&j.config, tokenString, opt, func(_ *jwtv5.Token) (any, error) {
+	return parseTokenImplContext(ctx, &j.config, tokenString, opt, func(_ *jwtv5.Token) (any, error) {
 		return j.secretKey, nil
 	}, j.signingMethod.Alg())
 }
@@ -84,10 +100,15 @@ func (j *JwtHmac) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (*cl
 // 即使缓存命中，仍会检查黑名单（token 可能在缓存后被加入黑名单）。
 // 当调用方传入 ParserOption 时，为避免缓存绕过更严格的校验条件，会直接退化为 ParseToken。
 func (j *JwtHmac) CachedParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
+	return j.CachedParseTokenContext(context.Background(), tokenString, opt...)
+}
+
+// CachedParseTokenContext 带缓存解析 JWT token，并尊重 ctx 取消和 deadline。
+func (j *JwtHmac) CachedParseTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	if j == nil {
 		return nil, ErrJWTNotInit
 	}
-	return cachedParseTokenImpl(&j.config, &j.cache, tokenString, opt, j.ParseToken)
+	return cachedParseTokenImplContext(ctx, &j.config, &j.cache, tokenString, opt, j.ParseTokenContext)
 }
 
 // ParallelVerify 并发验证多个 token。
@@ -97,6 +118,15 @@ func (j *JwtHmac) ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) ([]
 		return nil, nil
 	}
 	return parallelVerifyImpl(tokens, opt, j.ParseToken)
+}
+
+// ParallelVerifyContext 并发验证多个 token，并在 ctx 取消后停止分发未开始的任务。
+// results[i] 与 errs[i] 对应同一个输入 tokens[i]。
+func (j *JwtHmac) ParallelVerifyContext(ctx context.Context, tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
+	if j == nil {
+		return nil, nil
+	}
+	return parallelVerifyImplContext(ctx, tokens, opt, j.ParseTokenContext)
 }
 
 // createHmacToken 使用指定的 HMAC-SHA 签名算法并返回 token 字符串。

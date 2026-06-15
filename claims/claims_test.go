@@ -23,7 +23,7 @@ func TestWithExpiresAtTimeSetAbsoluteTime(t *testing.T) {
 	WithExpiresAtTime(target)(c)
 
 	require.NotNil(t, c.ExpiresAt)
-	require.True(t, c.ExpiresAt.Time.Equal(target))
+	require.True(t, c.ExpiresAt.Equal(target))
 }
 
 func TestDeprecatedWithExpiresAtDelegatesToWithExpiresIn(t *testing.T) {

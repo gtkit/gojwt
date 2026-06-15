@@ -1,12 +1,13 @@
 package gojwt
 
 import (
+	"container/list"
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	jwtv5 "github.com/golang-jwt/jwt/v5"
@@ -26,10 +27,17 @@ type cachedClaims struct {
 	expiresAt time.Time
 }
 
-// claimsCache 是基于 sync.Map 的轻量缓存，带惰性过期清扫。
+type claimsCacheEntry struct {
+	token string
+	value cachedClaims
+}
+
+// claimsCache 是实例级 LRU 缓存，带严格容量上限和惰性过期清扫。
 type claimsCache struct {
-	entries   sync.Map
-	lastSweep atomic.Int64
+	mu        sync.Mutex
+	entries   map[string]*list.Element
+	lru       list.List
+	lastSweep time.Time
 }
 
 // normalizeParseError 将 golang-jwt 的内部错误归一化为本包的 sentinel error。
@@ -69,22 +77,12 @@ func normalizeParseError(err error) error {
 // loadCachedClaims 从缓存中加载 Claims。
 // 命中时返回深拷贝副本，过期条目会被自动删除。
 func loadCachedClaims(cache *claimsCache, token string) (*claims.Claims, bool) {
-	now := time.Now()
-	cache.maybeSweepExpired(now)
+	if cache == nil {
+		return nil, false
+	}
 
-	value, ok := cache.entries.Load(token)
+	entry, ok := cache.load(token, time.Now())
 	if !ok {
-		return nil, false
-	}
-
-	entry, ok := value.(cachedClaims)
-	if !ok || entry.claims == nil {
-		cache.entries.Delete(token)
-		return nil, false
-	}
-
-	if !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt) {
-		cache.entries.Delete(token)
 		return nil, false
 	}
 
@@ -92,12 +90,10 @@ func loadCachedClaims(cache *claimsCache, token string) (*claims.Claims, bool) {
 }
 
 // storeCachedClaims 将 Claims 深拷贝后存入缓存。
-func storeCachedClaims(cache *claimsCache, token string, tokenClaims *claims.Claims) {
-	if tokenClaims == nil {
+func storeCachedClaims(cache *claimsCache, maxEntries int, token string, tokenClaims *claims.Claims) {
+	if cache == nil || tokenClaims == nil || maxEntries <= 0 {
 		return
 	}
-
-	cache.maybeSweepExpired(time.Now())
 
 	entry := cachedClaims{
 		claims: cloneClaims(tokenClaims),
@@ -105,7 +101,7 @@ func storeCachedClaims(cache *claimsCache, token string, tokenClaims *claims.Cla
 	if tokenClaims.ExpiresAt != nil {
 		entry.expiresAt = tokenClaims.ExpiresAt.Time
 	}
-	cache.entries.Store(token, entry)
+	cache.store(maxEntries, token, entry, time.Now())
 }
 
 // refreshTokenClaims 检查刷新条件并轮换 TokenID、更新时间字段。
@@ -138,27 +134,130 @@ func refreshTokenClaims(tokenClaims *claims.Claims, tokenDuration, refreshDurati
 }
 
 // maybeSweepExpired 惰性清扫过期缓存条目。
-// 通过 CAS 操作保证同一时刻只有一个 goroutine 执行清扫。
+// 调用方必须先持有 c.mu。
 func (c *claimsCache) maybeSweepExpired(now time.Time) {
 	if c == nil {
 		return
 	}
 
-	last := c.lastSweep.Load()
-	if last != 0 && now.UnixNano()-last < int64(cacheSweepInterval) {
+	if !c.lastSweep.IsZero() && now.Sub(c.lastSweep) < cacheSweepInterval {
 		return
 	}
-	if !c.lastSweep.CompareAndSwap(last, now.UnixNano()) {
+	c.lastSweep = now
+
+	for element := c.lru.Back(); element != nil; {
+		prev := element.Prev()
+		entry, ok := element.Value.(*claimsCacheEntry)
+		if !ok || entry == nil || entry.value.claims == nil || isCachedClaimsExpired(entry.value, now) {
+			c.deleteElement(element)
+		}
+		element = prev
+	}
+}
+
+func (c *claimsCache) load(token string, now time.Time) (cachedClaims, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.maybeSweepExpired(now)
+	if c.entries == nil {
+		return cachedClaims{}, false
+	}
+
+	element, ok := c.entries[token]
+	if !ok {
+		return cachedClaims{}, false
+	}
+	entry, ok := element.Value.(*claimsCacheEntry)
+	if !ok || entry == nil || entry.value.claims == nil || isCachedClaimsExpired(entry.value, now) {
+		c.deleteElement(element)
+		return cachedClaims{}, false
+	}
+
+	c.lru.MoveToFront(element)
+	return entry.value, true
+}
+
+func (c *claimsCache) store(maxEntries int, token string, value cachedClaims, now time.Time) {
+	if maxEntries <= 0 || token == "" || value.claims == nil {
 		return
 	}
 
-	c.entries.Range(func(key, value any) bool {
-		entry, ok := value.(cachedClaims)
-		if !ok || entry.claims == nil || (!entry.expiresAt.IsZero() && !now.Before(entry.expiresAt)) {
-			c.entries.Delete(key)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.entries == nil {
+		c.entries = make(map[string]*list.Element)
+	}
+
+	c.maybeSweepExpired(now)
+	if element, ok := c.entries[token]; ok {
+		element.Value = &claimsCacheEntry{token: token, value: value}
+		c.lru.MoveToFront(element)
+		return
+	}
+
+	for len(c.entries) >= maxEntries {
+		c.deleteElement(c.lru.Back())
+	}
+
+	c.entries[token] = c.lru.PushFront(&claimsCacheEntry{token: token, value: value})
+}
+
+func (c *claimsCache) deleteElement(element *list.Element) {
+	if element == nil {
+		return
+	}
+	entry, ok := element.Value.(*claimsCacheEntry)
+	if ok && entry != nil && c.entries != nil {
+		delete(c.entries, entry.token)
+	}
+	c.lru.Remove(element)
+}
+
+func isCachedClaimsExpired(entry cachedClaims, now time.Time) bool {
+	return !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt)
+}
+
+// checkBlacklistContext 根据配置执行黑名单检查，并将 ctx 透传给支持 context 的检查函数。
+func checkBlacklistContext(ctx context.Context, cfg *config, tokenID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if cfg == nil || tokenID == "" {
+		return nil
+	}
+
+	if cfg.blacklistCheckContextFunc != nil {
+		blacklisted, err := cfg.blacklistCheckContextFunc(ctx, tokenID)
+		if err != nil {
+			return fmt.Errorf("check token blacklist: %w", err)
 		}
-		return true
-	})
+		if blacklisted {
+			return ErrTokenBlacklisted
+		}
+		return nil
+	}
+
+	if cfg.blacklistCheckFunc != nil {
+		blacklisted, err := cfg.blacklistCheckFunc(tokenID)
+		if err != nil {
+			return fmt.Errorf("check token blacklist: %w", err)
+		}
+		if blacklisted {
+			return ErrTokenBlacklisted
+		}
+		return nil
+	}
+
+	if cfg.isBlacklisted != nil && cfg.isBlacklisted(tokenID) {
+		return ErrTokenBlacklisted
+	}
+
+	return nil
 }
 
 // cloneClaims 对 Claims 进行深拷贝，防止缓存被调用方意外修改。
@@ -206,36 +305,21 @@ func alignTokenIdentifiers(tokenClaims *claims.Claims, generatedTokenID string) 
 	tokenClaims.ID = tokenClaims.TokenID
 }
 
-// checkBlacklist 根据配置执行黑名单检查。
-func checkBlacklist(cfg *config, tokenID string) error {
-	if cfg == nil || tokenID == "" {
-		return nil
-	}
-
-	if cfg.blacklistCheckFunc != nil {
-		blacklisted, err := cfg.blacklistCheckFunc(tokenID)
-		if err != nil {
-			return fmt.Errorf("check token blacklist: %w", err)
-		}
-		if blacklisted {
-			return ErrTokenBlacklisted
-		}
-		return nil
-	}
-
-	if cfg.isBlacklisted != nil && cfg.isBlacklisted(tokenID) {
-		return ErrTokenBlacklisted
-	}
-
-	return nil
-}
-
-// parallelVerifyClaims 使用有界 worker pool 并发验证多个 token。
-// 结果顺序与输入顺序严格对齐。
-func parallelVerifyClaims(tokens []string, verify func(string) (*claims.Claims, error)) ([]*claims.Claims, []error) {
+// parallelVerifyClaimsContext 使用有界 worker pool 并发验证多个 token，并尊重 ctx 取消。
+// 结果顺序与输入顺序严格对齐；取消后未开始的任务返回 ctx.Err()。
+func parallelVerifyClaimsContext(ctx context.Context, tokens []string, verify func(string) (*claims.Claims, error)) ([]*claims.Claims, []error) {
 	results := make([]*claims.Claims, len(tokens))
 	errs := make([]error, len(tokens))
 	if len(tokens) == 0 {
+		return results, errs
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
 		return results, errs
 	}
 
@@ -254,7 +338,25 @@ func parallelVerifyClaims(tokens []string, verify func(string) (*claims.Claims, 
 	}
 
 	for index := range tokens {
-		jobs <- index
+		if err := ctx.Err(); err != nil {
+			for remaining := index; remaining < len(tokens); remaining++ {
+				errs[remaining] = err
+			}
+			close(jobs)
+			wg.Wait()
+			return results, errs
+		}
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			for remaining := index; remaining < len(tokens); remaining++ {
+				errs[remaining] = err
+			}
+			close(jobs)
+			wg.Wait()
+			return results, errs
+		case jobs <- index:
+		}
 	}
 	close(jobs)
 
@@ -286,6 +388,9 @@ func generateTokenImpl(cfg *config, uid int64, options []claims.Option, signFn f
 	}
 
 	for _, opt := range options {
+		if opt == nil {
+			continue
+		}
 		opt(tokenClaims)
 	}
 	alignTokenIdentifiers(tokenClaims, tokenID)
@@ -293,12 +398,19 @@ func generateTokenImpl(cfg *config, uid int64, options []claims.Option, signFn f
 	return signFn(tokenClaims)
 }
 
-// parseTokenImpl 是 ParseToken 的通用实现。
+// parseTokenImplContext 是 ParseTokenContext 的通用实现。
 // cfg 提供 parseLeeway，keyFunc 由具体实现提供（获取验签密钥并验证算法）。
-func parseTokenImpl(cfg *config, tokenString string, opt []jwtv5.ParserOption, keyFunc func(*jwtv5.Token) (any, error), expectedAlg string) (*claims.Claims, error) {
+func parseTokenImplContext(ctx context.Context, cfg *config, tokenString string, opt []jwtv5.ParserOption, keyFunc func(*jwtv5.Token) (any, error), expectedAlg string) (*claims.Claims, error) {
 	if tokenString == "" {
 		return nil, ErrTokenMalformed
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	parserOptions := append([]jwtv5.ParserOption{
 		jwtv5.WithValidMethods([]string{expectedAlg}),
 		jwtv5.WithLeeway(cfg.parseLeeway),
@@ -318,17 +430,17 @@ func parseTokenImpl(cfg *config, tokenString string, opt []jwtv5.ParserOption, k
 		return nil, ErrTokenInvalid
 	}
 
-	if err := checkBlacklist(cfg, c.TokenID); err != nil {
+	if err := checkBlacklistContext(ctx, cfg, c.TokenID); err != nil {
 		return nil, err
 	}
 
 	return c, nil
 }
 
-// refreshTokenImpl 是 RefreshToken 的通用实现。
+// refreshTokenImplContext 是 RefreshTokenContext 的通用实现。
 // parseFn 和 signFn 由具体实现提供。
-func refreshTokenImpl(cfg *config, tokenString string, opt []jwtv5.ParserOption, parseFn func(string, ...jwtv5.ParserOption) (*claims.Claims, error), signFn func(*claims.Claims) (string, error)) (string, error) {
-	tokenClaims, err := parseFn(tokenString, opt...)
+func refreshTokenImplContext(ctx context.Context, cfg *config, tokenString string, opt []jwtv5.ParserOption, parseFn func(context.Context, string, ...jwtv5.ParserOption) (*claims.Claims, error), signFn func(*claims.Claims) (string, error)) (string, error) {
+	tokenClaims, err := parseFn(ctx, tokenString, opt...)
 	if err != nil {
 		return "", err
 	}
@@ -341,35 +453,51 @@ func refreshTokenImpl(cfg *config, tokenString string, opt []jwtv5.ParserOption,
 	return signFn(tokenClaims)
 }
 
-// cachedParseTokenImpl 是 CachedParseToken 的通用实现。
-// parseFn 由具体实现提供，通常指向具体类型的 ParseToken。
-func cachedParseTokenImpl(cfg *config, cache *claimsCache, tokenString string, opt []jwtv5.ParserOption, parseFn func(string, ...jwtv5.ParserOption) (*claims.Claims, error)) (*claims.Claims, error) {
+// cachedParseTokenImplContext 是 CachedParseTokenContext 的通用实现。
+// parseFn 由具体实现提供，通常指向具体类型的 ParseTokenContext。
+func cachedParseTokenImplContext(ctx context.Context, cfg *config, cache *claimsCache, tokenString string, opt []jwtv5.ParserOption, parseFn func(context.Context, string, ...jwtv5.ParserOption) (*claims.Claims, error)) (*claims.Claims, error) {
 	if tokenString == "" {
 		return nil, ErrTokenMalformed
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(opt) > 0 {
-		return parseFn(tokenString, opt...)
+		return parseFn(ctx, tokenString, opt...)
+	}
+	if cfg == nil || cfg.cacheMaxEntries <= 0 {
+		return parseFn(ctx, tokenString, opt...)
 	}
 
 	if c, ok := loadCachedClaims(cache, tokenString); ok {
-		if err := checkBlacklist(cfg, c.TokenID); err != nil {
+		if err := checkBlacklistContext(ctx, cfg, c.TokenID); err != nil {
 			return nil, err
 		}
 		return c, nil
 	}
 
-	tokenClaims, err := parseFn(tokenString, opt...)
+	tokenClaims, err := parseFn(ctx, tokenString, opt...)
 	if err != nil {
 		return nil, err
 	}
 
-	storeCachedClaims(cache, tokenString, tokenClaims)
+	storeCachedClaims(cache, cfg.cacheMaxEntries, tokenString, tokenClaims)
 	return tokenClaims, nil
 }
 
 // parallelVerifyImpl 是 ParallelVerify 的通用实现。
 func parallelVerifyImpl(tokens []string, opt []jwtv5.ParserOption, parseFn func(string, ...jwtv5.ParserOption) (*claims.Claims, error)) ([]*claims.Claims, []error) {
-	return parallelVerifyClaims(tokens, func(token string) (*claims.Claims, error) {
+	return parallelVerifyImplContext(context.Background(), tokens, opt, func(_ context.Context, token string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 		return parseFn(token, opt...)
+	})
+}
+
+// parallelVerifyImplContext 是 ParallelVerifyContext 的通用实现。
+func parallelVerifyImplContext(ctx context.Context, tokens []string, opt []jwtv5.ParserOption, parseFn func(context.Context, string, ...jwtv5.ParserOption) (*claims.Claims, error)) ([]*claims.Claims, []error) {
+	return parallelVerifyClaimsContext(ctx, tokens, func(token string) (*claims.Claims, error) {
+		return parseFn(ctx, token, opt...)
 	})
 }

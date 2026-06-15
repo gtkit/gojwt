@@ -1,0 +1,61 @@
+name: CI
+
+# 在主分支推送和 PR 阶段都执行同一套上线前检查。
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+# 只需要读取仓库内容；不授予写权限。
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint And Test
+    runs-on: ubuntu-latest
+    # RSA race 测试和 fuzz 冒烟会比普通单测慢，给 CI 留出稳定余量。
+    timeout-minutes: 20
+
+    steps:
+      # 拉取完整工作区，供 Go 工具链读取源码、测试和文档。
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # 使用项目指定的 Go 版本，避免本地和 CI 工具链行为不一致。
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.2"
+          cache: true
+
+      # 先下载依赖，后续 lint/test 可复用 module cache。
+      - name: Download Modules
+        run: go mod download
+
+      # 固定 golangci-lint 版本，避免 action 默认升级导致规则漂移。
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          args: ./...
+
+      # go vet 覆盖标准库静态检查，和 golangci-lint 互补。
+      - name: go vet
+        run: go vet ./...
+
+      # 缓存、黑名单和批量验签都有共享状态，必须跑 race 检查。
+      - name: Race Tests
+        run: go test -race -count=1 -timeout=5m ./...
+
+      # 生成覆盖率报告，确保企业级覆盖率要求持续满足。
+      - name: Coverage
+        run: go test -coverprofile=coverage.out ./...
+
+      # fuzz 冒烟覆盖畸形 token 和 PEM 输入，防止解析入口 panic 回归。
+      - name: Fuzz Seeds
+        run: |
+          go test -run=^$ -fuzz=FuzzJwtHmacParseToken -fuzztime=5s .
+          go test -run=^$ -fuzz=FuzzPEMKeyParsers -fuzztime=5s .

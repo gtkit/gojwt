@@ -2,6 +2,7 @@ package gojwt_test
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"encoding/json"
 	"errors"
@@ -51,6 +52,20 @@ func TestJwtOptionsApplyToTokenDuration(t *testing.T) {
 	tokenClaims, err := j.ParseToken(token)
 	require.NoError(t, err)
 	require.Less(t, tokenClaims.TTL(), time.Minute+5*time.Second)
+}
+
+func TestJwtHmacIgnoresNilOptions(t *testing.T) {
+	key := []byte("12345678901234567890123456789012")
+	j, err := gojwt.NewJwtHmac(key, nil)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(10, nil, claims.WithRole("admin"))
+	require.NoError(t, err)
+
+	tokenClaims, err := j.ParseToken(token)
+	require.NoError(t, err)
+	require.Equal(t, int64(10), tokenClaims.UserID)
+	require.Equal(t, []string{"admin"}, tokenClaims.Roles)
 }
 
 func TestParseTokenAllowsSmallClockSkewByDefault(t *testing.T) {
@@ -356,6 +371,33 @@ func TestNewJwtEd25519RejectsHMACSigningMethodOption(t *testing.T) {
 	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
 }
 
+func TestNewJwtEd25519IgnoresNilOption(t *testing.T) {
+	dir := t.TempDir()
+	priPath := filepath.Join(dir, "jwt_ed25519.pem")
+	pubPath := filepath.Join(dir, "jwt_ed25519.pub.pem")
+	require.NoError(t, gojwt.GenerateEd25519Keys(priPath, pubPath))
+
+	j, err := gojwt.NewJwtEd25519(priPath, pubPath, nil)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(11, nil)
+	require.NoError(t, err)
+
+	tokenClaims, err := j.ParseToken(token)
+	require.NoError(t, err)
+	require.Equal(t, int64(11), tokenClaims.UserID)
+}
+
+func TestNewJwtEd25519RejectsNegativeCacheMaxEntries(t *testing.T) {
+	dir := t.TempDir()
+	priPath := filepath.Join(dir, "jwt_ed25519.pem")
+	pubPath := filepath.Join(dir, "jwt_ed25519.pub.pem")
+	require.NoError(t, gojwt.GenerateEd25519Keys(priPath, pubPath))
+
+	_, err := gojwt.NewJwtEd25519(priPath, pubPath, gojwt.WithCacheMaxEntries(-1))
+	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
+}
+
 func TestNewJwtHmacRejectsShortSecret(t *testing.T) {
 	_, err := gojwt.NewJwtHmac([]byte("short-secret"))
 	require.Error(t, err)
@@ -399,6 +441,13 @@ func TestNewJwtHmacRejectsNegativeParseLeeway(t *testing.T) {
 	key := []byte("12345678901234567890123456789012")
 
 	_, err := gojwt.NewJwtHmac(key, gojwt.WithParseLeeway(-time.Second))
+	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
+}
+
+func TestNewJwtHmacRejectsNegativeCacheMaxEntries(t *testing.T) {
+	key := []byte("12345678901234567890123456789012")
+
+	_, err := gojwt.NewJwtHmac(key, gojwt.WithCacheMaxEntries(-1))
 	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
 }
 
@@ -485,7 +534,7 @@ func TestBlacklistAddTokenRejectsInvalidClaims(t *testing.T) {
 }
 
 func TestOptionAliasesRemainUsable(t *testing.T) {
-	var option gojwt.Options = gojwt.WithTokenDuration(time.Minute)
+	option := gojwt.Options(gojwt.WithTokenDuration(time.Minute))
 	require.NotNil(t, option)
 
 	var claimOption claims.Options = claims.WithPrv("admin") //nolint:staticcheck // verify deprecated alias remains usable
@@ -767,6 +816,62 @@ func TestCachedParseTokenPropagatesBlacklistCheckErrorOnCacheHit(t *testing.T) {
 	require.ErrorIs(t, err, expected)
 }
 
+func TestCachedParseTokenRespectsCacheMaxEntries(t *testing.T) {
+	key := []byte("12345678901234567890123456789012")
+	calls := 0
+
+	j, err := gojwt.NewJwtHmac(
+		key,
+		gojwt.WithCacheMaxEntries(1),
+		gojwt.WithBlacklistCheckFunc(func(tokenID string) (bool, error) {
+			calls++
+			return false, nil
+		}),
+	)
+	require.NoError(t, err)
+
+	first, err := j.GenerateToken(1)
+	require.NoError(t, err)
+	second, err := j.GenerateToken(2)
+	require.NoError(t, err)
+
+	_, err = j.CachedParseToken(first)
+	require.NoError(t, err)
+	_, err = j.CachedParseToken(second)
+	require.NoError(t, err)
+	_, err = j.CachedParseToken(first)
+	require.NoError(t, err)
+	_, err = j.CachedParseToken(second)
+	require.NoError(t, err)
+
+	require.Equal(t, 4, calls)
+}
+
+func TestCachedParseTokenCanDisableCache(t *testing.T) {
+	key := []byte("12345678901234567890123456789012")
+	calls := 0
+
+	j, err := gojwt.NewJwtHmac(
+		key,
+		gojwt.WithCacheMaxEntries(0),
+		gojwt.WithBlacklistCheckFunc(func(tokenID string) (bool, error) {
+			calls++
+			return false, nil
+		}),
+	)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(1)
+	require.NoError(t, err)
+
+	_, err = j.CachedParseToken(token)
+	require.NoError(t, err)
+	_, err = j.CachedParseToken(token)
+	require.NoError(t, err)
+
+	require.Equal(t, 2, calls)
+}
+
 func TestGenerateTokenKeepsTokenIDAndJwtIDAligned(t *testing.T) {
 	key := []byte("12345678901234567890123456789012")
 	j, err := gojwt.NewJwtHmac(
@@ -816,9 +921,9 @@ func TestRefreshTokenUpdatesIatAndNbf(t *testing.T) {
 	refreshedClaims, err := j.ParseToken(refreshed)
 	require.NoError(t, err)
 
-	require.True(t, refreshedClaims.IssuedAt.Time.After(originalClaims.IssuedAt.Time),
+	require.True(t, refreshedClaims.IssuedAt.After(originalClaims.IssuedAt.Time),
 		"iat should be updated after refresh")
-	require.True(t, refreshedClaims.NotBefore.Time.After(originalClaims.NotBefore.Time),
+	require.True(t, refreshedClaims.NotBefore.After(originalClaims.NotBefore.Time),
 		"nbf should be updated after refresh")
 }
 
@@ -851,8 +956,8 @@ func TestJwtEd25519RefreshTokenUpdatesIatAndNbf(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotEqual(t, originalClaims.TokenID, refreshedClaims.TokenID)
-	require.True(t, refreshedClaims.IssuedAt.Time.After(originalClaims.IssuedAt.Time))
-	require.True(t, refreshedClaims.NotBefore.Time.After(originalClaims.NotBefore.Time))
+	require.True(t, refreshedClaims.IssuedAt.After(originalClaims.IssuedAt.Time))
+	require.True(t, refreshedClaims.NotBefore.After(originalClaims.NotBefore.Time))
 }
 
 func TestJwtEd25519ParallelVerify(t *testing.T) {
@@ -1023,6 +1128,159 @@ func TestJwtHmacNilReceiverSafety(t *testing.T) {
 	results, errs := j.ParallelVerify([]string{"token"})
 	require.Nil(t, results)
 	require.Nil(t, errs)
+}
+
+func TestParallelVerifyContextCanceledBeforeStart(t *testing.T) {
+	key := []byte("12345678901234567890123456789012")
+	j, err := gojwt.NewJwtHmac(key)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(1)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	results, errs := j.ParallelVerifyContext(ctx, []string{token, token})
+	require.Len(t, results, 2)
+	require.Len(t, errs, 2)
+	require.Nil(t, results[0])
+	require.Nil(t, results[1])
+	require.ErrorIs(t, errs[0], context.Canceled)
+	require.ErrorIs(t, errs[1], context.Canceled)
+}
+
+func TestParallelVerifyContextCanceledDuringDispatch(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	j, err := gojwt.NewJwtHmac(
+		[]byte("12345678901234567890123456789012"),
+		gojwt.WithBlacklistCheckFunc(func(tokenID string) (bool, error) {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-release
+			return false, nil
+		}),
+	)
+	require.NoError(t, err)
+
+	tokens := make([]string, 4)
+	for i := range tokens {
+		tokens[i], err = j.GenerateToken(int64(i + 1))
+		require.NoError(t, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan []error, 1)
+	go func() {
+		_, errs := j.ParallelVerifyContext(ctx, tokens)
+		done <- errs
+	}()
+
+	<-started
+	cancel()
+	close(release)
+
+	errs := <-done
+	var canceled int
+	for _, err := range errs {
+		if errors.Is(err, context.Canceled) {
+			canceled++
+		}
+	}
+	require.Greater(t, canceled, 0)
+}
+
+func TestParseTokenContextPassesContextToBlacklistCheck(t *testing.T) {
+	key := []byte("12345678901234567890123456789012")
+	type contextKey struct{}
+	ctxKey := contextKey{}
+	ctxValue := "request-id"
+
+	j, err := gojwt.NewJwtHmac(
+		key,
+		gojwt.WithBlacklistCheckContextFunc(func(ctx context.Context, tokenID string) (bool, error) {
+			require.NotEmpty(t, tokenID)
+			require.Equal(t, ctxValue, ctx.Value(ctxKey))
+			return false, nil
+		}),
+	)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(1)
+	require.NoError(t, err)
+
+	tokenClaims, err := j.ParseTokenContext(context.WithValue(context.Background(), ctxKey, ctxValue), token)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), tokenClaims.UserID)
+}
+
+func TestParseTokenContextCanceledBeforeBlacklistCheck(t *testing.T) {
+	key := []byte("12345678901234567890123456789012")
+	called := false
+
+	j, err := gojwt.NewJwtHmac(
+		key,
+		gojwt.WithBlacklistCheckContextFunc(func(ctx context.Context, tokenID string) (bool, error) {
+			called = true
+			return false, nil
+		}),
+	)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(1)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = j.ParseTokenContext(ctx, token)
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, called)
+}
+
+func TestCachedParseTokenContextChecksBlacklistOnCacheHit(t *testing.T) {
+	key := []byte("12345678901234567890123456789012")
+	calls := 0
+
+	j, err := gojwt.NewJwtHmac(
+		key,
+		gojwt.WithBlacklistCheckContextFunc(func(ctx context.Context, tokenID string) (bool, error) {
+			require.NoError(t, ctx.Err())
+			calls++
+			return calls > 1, nil
+		}),
+	)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(1)
+	require.NoError(t, err)
+
+	_, err = j.CachedParseTokenContext(context.Background(), token)
+	require.NoError(t, err)
+
+	_, err = j.CachedParseTokenContext(context.Background(), token)
+	require.ErrorIs(t, err, gojwt.ErrTokenBlacklisted)
+	require.Equal(t, 2, calls)
+}
+
+func TestContextTokenerImplementations(t *testing.T) {
+	var _ gojwt.ContextTokener = (*gojwt.JwtHmac)(nil)
+	var _ gojwt.ContextTokener = (*gojwt.JwtEd25519)(nil)
+	var _ gojwt.ContextTokener = (*gojwt.JwtRSA)(nil)
+}
+
+func TestContextParallelVerifierImplementations(t *testing.T) {
+	var _ gojwt.ContextParallelVerifier = (*gojwt.JwtHmac)(nil)
+	var _ gojwt.ContextParallelVerifier = (*gojwt.JwtEd25519)(nil)
+	var _ gojwt.ContextParallelVerifier = (*gojwt.JwtRSA)(nil)
 }
 
 func TestJwtEd25519NilReceiverSafety(t *testing.T) {

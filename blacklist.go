@@ -41,6 +41,7 @@ var (
 
 // Blacklist 是基于内存 map 的并发安全黑名单实现。
 // 适用于单实例部署；多实例场景请使用 Redis 等外部存储。
+// Blacklist 可被多个 goroutine 并发使用。
 type Blacklist struct {
 	mu        sync.RWMutex
 	m         map[string]time.Time

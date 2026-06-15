@@ -1,6 +1,7 @@
 package gojwt
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -12,6 +13,7 @@ type config struct {
 	tokenDuration   time.Duration
 	refreshDuration time.Duration
 	parseLeeway     time.Duration
+	cacheMaxEntries int
 
 	// isBlacklisted 是外部注入的黑名单检查函数。
 	// 返回 true 表示该 tokenID 已被拉黑（已注销/已撤回）。
@@ -21,6 +23,10 @@ type config struct {
 	// blacklistCheckFunc 支持返回错误的黑名单检查函数。
 	// 用于 Redis/DB 等外部存储故障时 fail closed。
 	blacklistCheckFunc func(tokenID string) (bool, error)
+
+	// blacklistCheckContextFunc 支持 context 取消和超时的黑名单检查函数。
+	// 当同时配置 blacklistCheckFunc 时，优先使用此函数。
+	blacklistCheckContextFunc func(ctx context.Context, tokenID string) (bool, error)
 
 	// hmacSigningMethod 为 JwtHmac 指定签名算法。
 	// 默认使用 HS256，可显式切换到 HS384 / HS512。
@@ -63,6 +69,15 @@ func WithParseLeeway(t time.Duration) Option {
 	}
 }
 
+// WithCacheMaxEntries 设置 CachedParseToken 的最大缓存条目数，默认 4096。
+//
+// n 为 0 时禁用缓存；当缓存已满时，会按 LRU 淘汰最久未使用的条目。
+func WithCacheMaxEntries(n int) Option {
+	return func(c *config) {
+		c.cacheMaxEntries = n
+	}
+}
+
 // WithBlacklistFunc 注入外部黑名单检查函数。
 //
 // fn 接收 tokenID（即 Claims.TokenID / RegisteredClaims.ID），
@@ -96,6 +111,14 @@ func WithBlacklistCheckFunc(fn func(tokenID string) (bool, error)) Option {
 	}
 }
 
+// WithBlacklistCheckContextFunc 注入支持 context 取消和超时的黑名单检查函数。
+// 当同时配置 WithBlacklistCheckFunc 时，优先使用此函数。
+func WithBlacklistCheckContextFunc(fn func(ctx context.Context, tokenID string) (bool, error)) Option {
+	return func(c *config) {
+		c.blacklistCheckContextFunc = fn
+	}
+}
+
 // WithHMACSigningMethod 为 JwtHmac 设置签名算法。
 // 默认使用 HS256，可选 HS384、HS512。
 func WithHMACSigningMethod(method *jwtv5.SigningMethodHMAC) Option {
@@ -121,7 +144,22 @@ func defaultConfig() config {
 		tokenDuration:   2 * time.Hour,
 		refreshDuration: 7 * 24 * time.Hour,
 		parseLeeway:     5 * time.Second,
+		cacheMaxEntries: 4096,
 	}
+}
+
+func newConfig(options ...Option) (config, error) {
+	cfg := defaultConfig()
+	for _, opt := range options {
+		if opt == nil {
+			continue
+		}
+		opt(&cfg)
+	}
+	if err := validateConfig(cfg); err != nil {
+		return config{}, err
+	}
+	return cfg, nil
 }
 
 func validateConfig(cfg config) error {
@@ -133,6 +171,9 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.parseLeeway < 0 {
 		return fmt.Errorf("%w: parse leeway must be greater than or equal to zero", ErrInvalidConfig)
+	}
+	if cfg.cacheMaxEntries < 0 {
+		return fmt.Errorf("%w: cache max entries must be greater than or equal to zero", ErrInvalidConfig)
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package gojwt
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/pem"
@@ -13,6 +14,7 @@ import (
 )
 
 // JwtEd25519 基于 Ed25519 (EdDSA) 签名的 JWT 实例。
+// JwtEd25519 可被多个 goroutine 并发使用。
 type JwtEd25519 struct {
 	privateKey ed25519.PrivateKey
 	publicKey  ed25519.PublicKey
@@ -31,17 +33,15 @@ func NewJwtEd25519(priPath, pubPath string, options ...Option) (*JwtEd25519, err
 	if err != nil {
 		return nil, err
 	}
+	cfg, err := newConfig(options...)
+	if err != nil {
+		return nil, err
+	}
 
 	j := &JwtEd25519{
 		privateKey: privateKey,
 		publicKey:  publicKey,
-		config:     defaultConfig(),
-	}
-	for _, opt := range options {
-		opt(&j.config)
-	}
-	if err := validateConfig(j.config); err != nil {
-		return nil, err
+		config:     cfg,
 	}
 	if j.hmacSigningSet {
 		return nil, fmt.Errorf("%w: HMAC signing method option is not applicable to Ed25519", ErrInvalidConfig)
@@ -70,7 +70,17 @@ func (j *JwtEd25519) RefreshToken(tokenString string, opt ...jwtv5.ParserOption)
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	return refreshTokenImpl(&j.config, tokenString, opt, j.ParseToken, func(cc *claims.Claims) (string, error) {
+	return refreshTokenImplContext(context.Background(), &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
+		return createEd25519Token(*cc, j.privateKey)
+	})
+}
+
+// RefreshTokenContext 在刷新窗口内刷新 JWT token，并尊重 ctx 取消和 deadline。
+func (j *JwtEd25519) RefreshTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (string, error) {
+	if j == nil {
+		return "", ErrJWTNotInit
+	}
+	return refreshTokenImplContext(ctx, &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
 		return createEd25519Token(*cc, j.privateKey)
 	})
 }
@@ -80,10 +90,15 @@ func (j *JwtEd25519) RefreshToken(tokenString string, opt ...jwtv5.ParserOption)
 // 如果通过 WithBlacklistFunc 配置了黑名单检查函数，
 // 解析成功后会自动检查 tokenID 是否被拉黑。
 func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
+	return j.ParseTokenContext(context.Background(), tokenString, opt...)
+}
+
+// ParseTokenContext 解析并验证 JWT token，并尊重 ctx 取消和 deadline。
+func (j *JwtEd25519) ParseTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	if j == nil {
 		return nil, ErrJWTNotInit
 	}
-	return parseTokenImpl(&j.config, tokenString, opt, func(_ *jwtv5.Token) (any, error) {
+	return parseTokenImplContext(ctx, &j.config, tokenString, opt, func(_ *jwtv5.Token) (any, error) {
 		return j.publicKey, nil
 	}, jwtv5.SigningMethodEdDSA.Alg())
 }
@@ -92,10 +107,15 @@ func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (
 // 即使缓存命中，仍会检查黑名单。
 // 当调用方传入 ParserOption 时，为避免缓存绕过更严格的校验条件，会直接退化为 ParseToken。
 func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
+	return j.CachedParseTokenContext(context.Background(), tokenString, opt...)
+}
+
+// CachedParseTokenContext 带缓存解析 JWT token，并尊重 ctx 取消和 deadline。
+func (j *JwtEd25519) CachedParseTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	if j == nil {
 		return nil, ErrJWTNotInit
 	}
-	return cachedParseTokenImpl(&j.config, &j.cache, tokenString, opt, j.ParseToken)
+	return cachedParseTokenImplContext(ctx, &j.config, &j.cache, tokenString, opt, j.ParseTokenContext)
 }
 
 // ParallelVerify 并发验证多个 token。
@@ -105,6 +125,15 @@ func (j *JwtEd25519) ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) 
 		return nil, nil
 	}
 	return parallelVerifyImpl(tokens, opt, j.ParseToken)
+}
+
+// ParallelVerifyContext 并发验证多个 token，并在 ctx 取消后停止分发未开始的任务。
+// results[i] 与 errs[i] 对应同一个输入 tokens[i]。
+func (j *JwtEd25519) ParallelVerifyContext(ctx context.Context, tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
+	if j == nil {
+		return nil, nil
+	}
+	return parallelVerifyImplContext(ctx, tokens, opt, j.ParseTokenContext)
 }
 
 // createEd25519Token 使用 EdDSA 签名并返回 token 字符串。

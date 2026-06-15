@@ -3,6 +3,7 @@ package gojwt_test
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"math/big"
 	"path/filepath"
 	"testing"
 	"time"
@@ -118,8 +119,8 @@ func TestJwtRSARefreshTokenRotatesTokenID(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, orig.TokenID, rc.TokenID)
 	require.Equal(t, rc.TokenID, rc.ID)
-	require.True(t, rc.IssuedAt.Time.After(orig.IssuedAt.Time))
-	require.True(t, rc.NotBefore.Time.After(orig.NotBefore.Time))
+	require.True(t, rc.IssuedAt.After(orig.IssuedAt.Time))
+	require.True(t, rc.NotBefore.After(orig.NotBefore.Time))
 }
 
 func TestJwtRSARefreshTooEarly(t *testing.T) {
@@ -217,6 +218,29 @@ func TestNewJwtRSAFromKeys(t *testing.T) {
 	require.Equal(t, int64(77), c.UserID)
 }
 
+func TestNewJwtRSAFromKeysCopiesInputKeys(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	j, err := gojwt.NewJwtRSAFromKeys(privateKey, &privateKey.PublicKey)
+	require.NoError(t, err)
+
+	token, err := j.GenerateToken(88)
+	require.NoError(t, err)
+
+	privateKey.D.SetInt64(1)
+	pub := &privateKey.PublicKey
+	pub.N.SetInt64(1)
+	pub.E = 3
+	for _, prime := range privateKey.Primes {
+		prime.SetInt64(1)
+	}
+
+	c, err := j.ParseToken(token)
+	require.NoError(t, err)
+	require.Equal(t, int64(88), c.UserID)
+}
+
 func TestNewJwtRSAFromKeysRejectsNil(t *testing.T) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
@@ -225,6 +249,27 @@ func TestNewJwtRSAFromKeysRejectsNil(t *testing.T) {
 	require.ErrorIs(t, err, gojwt.ErrInvalidKey)
 
 	_, err = gojwt.NewJwtRSAFromKeys(privateKey, nil)
+	require.ErrorIs(t, err, gojwt.ErrInvalidKey)
+}
+
+func TestNewJwtRSAFromKeysRejectsMismatchedPublicKey(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	_, err = gojwt.NewJwtRSAFromKeys(privateKey, &otherKey.PublicKey)
+	require.ErrorIs(t, err, gojwt.ErrInvalidKey)
+}
+
+func TestNewJwtRSAFromKeysRejectsInvalidPrivateKeyShape(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	invalidKey := *privateKey
+	invalidKey.Primes = append([]*big.Int(nil), privateKey.Primes...)
+	invalidKey.Primes[0] = nil
+
+	_, err = gojwt.NewJwtRSAFromKeys(&invalidKey, &privateKey.PublicKey)
 	require.ErrorIs(t, err, gojwt.ErrInvalidKey)
 }
 
@@ -273,6 +318,13 @@ func TestNewJwtRSARejectsNonPositiveDurations(t *testing.T) {
 	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
 
 	_, err = gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithRefreshDuration(-time.Minute))
+	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
+}
+
+func TestNewJwtRSARejectsNegativeCacheMaxEntries(t *testing.T) {
+	priPath, pubPath := generateRSAKeyFiles(t, 2048)
+
+	_, err := gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithCacheMaxEntries(-1))
 	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
 }
 

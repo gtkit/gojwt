@@ -5,6 +5,30 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.0.4] - 2026-06-15
+
+### Added
+
+- `WithCacheMaxEntries`：限制 `CachedParseToken` 的最大缓存条目数
+- `WithBlacklistCheckContextFunc`：支持 context 取消和超时的黑名单检查函数
+- `ParseTokenContext` / `CachedParseTokenContext` / `RefreshTokenContext`
+- `ParallelVerifyContext`：支持 context 取消的并发验签
+- `ContextParser` / `ContextCachedParser` / `ContextRefresher` / `ContextParallelVerifier` / `ContextTokener`
+- fuzz 测试覆盖畸形 token 输入和 PEM key 解析入口
+- GitHub Actions CI 固化 lint、vet、race test、coverage 和 fuzz seed 检查
+
+### Changed
+
+- `JwtHmac` / `JwtEd25519` / `JwtRSA` 文档明确说明可并发使用
+- `NewJwtRSAFromKeys` 复制输入 RSA 密钥并预计算私钥
+- `generateTokenImpl` 允许忽略 `nil` 的 claims option
+- `CachedParseToken` 缓存改为严格容量上限的实例级 LRU
+
+### Fixed
+
+- `CachedParseToken` 在高基数 token 场景下不再无上限增长
+- `ParallelVerify` 相关并发实现支持取消后的快速退出
+
 ## [v1.0.3] - 2025-04-10
 
 ### Added
@@ -81,6 +105,7 @@
 - 内存黑名单基础实现 `Blacklist`
 - sentinel error 体系
 
+[v1.0.4]: https://github.com/gtkit/gojwt/compare/v1.0.3...v1.0.4
 [v1.0.3]: https://github.com/gtkit/gojwt/compare/v1.0.2...v1.0.3
 [v1.0.2]: https://github.com/gtkit/gojwt/compare/v1.0.1...v1.0.2
 [v1.0.1]: https://github.com/gtkit/gojwt/compare/v1.0.0...v1.0.1

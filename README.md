@@ -43,7 +43,7 @@ Go 生态中已经有了 `github.com/golang-jwt/jwt/v5` 这样优秀的底层 JW
 - 支持标准字段与业务字段混合签发
 - 支持临近过期时刷新 Token
 - 支持缓存解析 `CachedParseToken`
-- 支持批量并发验签 `ParallelVerify`
+- 支持带 context 的解析、刷新、缓存解析和批量并发验签
 - 提供并发安全内存黑名单
 - 提供统一接口 `Tokener`
 - 错误统一为 sentinel error，便于 `errors.Is`
@@ -125,6 +125,7 @@ type Claims struct {
 - `tokenDuration = 2 小时`
 - `refreshDuration = 7 天`
 - `parseLeeway = 5 秒`
+- `cacheMaxEntries = 4096`
 
 可以通过构造时的 Option 修改。
 
@@ -546,6 +547,8 @@ _ = j
 用于注入可返回错误的黑名单检查函数，适合 Redis、数据库等外部依赖场景。
 
 ```go
+ctx := context.Background()
+
 j, err := gojwt.NewJwtHmac(
     []byte("12345678901234567890123456789012"),
     gojwt.WithBlacklistCheckFunc(func(tokenID string) (bool, error) {
@@ -557,6 +560,30 @@ if err != nil {
     panic(err)
 }
 _ = j
+```
+
+### `WithBlacklistCheckContextFunc`
+
+用于注入支持 `context.Context` 的黑名单检查函数，适合 Redis、数据库等需要超时控制的外部依赖场景。
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+defer cancel()
+token := "your.jwt.token.here"
+
+j, err := gojwt.NewJwtHmac(
+    []byte("12345678901234567890123456789012"),
+    gojwt.WithBlacklistCheckContextFunc(func(ctx context.Context, tokenID string) (bool, error) {
+        n, err := rdb.Exists(ctx, "jwt:blacklist:"+tokenID).Result()
+        return n > 0, err
+    }),
+)
+if err != nil {
+    panic(err)
+}
+
+_, err = j.ParseTokenContext(ctx, token)
+_ = err
 ```
 
 ## HMAC 算法选择
@@ -634,8 +661,11 @@ func (j *JwtRSA) GenerateToken(uid int64, options ...claims.Option) (string, err
 
 ```go
 func (j *JwtHmac) ParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
+func (j *JwtHmac) ParseTokenContext(ctx context.Context, tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 func (j *JwtEd25519) ParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
+func (j *JwtEd25519) ParseTokenContext(ctx context.Context, tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 func (j *JwtRSA) ParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
+func (j *JwtRSA) ParseTokenContext(ctx context.Context, tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 ```
 
 行为说明：
@@ -662,8 +692,11 @@ fmt.Println("uid:", tokenClaims.UserID)
 
 ```go
 func (j *JwtHmac) CachedParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
+func (j *JwtHmac) CachedParseTokenContext(ctx context.Context, tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 func (j *JwtEd25519) CachedParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
+func (j *JwtEd25519) CachedParseTokenContext(ctx context.Context, tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 func (j *JwtRSA) CachedParseToken(tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
+func (j *JwtRSA) CachedParseTokenContext(ctx context.Context, tokenString string, opt ...jwt.ParserOption) (*claims.Claims, error)
 ```
 
 行为说明：
@@ -676,8 +709,10 @@ func (j *JwtRSA) CachedParseToken(tokenString string, opt ...jwt.ParserOption) (
 注意事项：
 
 - 缓存是“实例级”的，不跨不同 JWT 实例共享
+- 缓存采用 LRU 淘汰，容量上限严格受 `WithCacheMaxEntries` 控制
 - 过期条目会做惰性清扫
-- 当前没有容量上限，极端大规模唯一 token 场景应自行评估
+- 默认最多缓存 `4096` 个 token，可通过 `WithCacheMaxEntries` 调整
+- `WithCacheMaxEntries(0)` 会关闭缓存路径，直接退化为普通解析
 
 示例：
 
@@ -695,8 +730,11 @@ fmt.Println("token id:", tokenClaims.TokenID)
 
 ```go
 func (j *JwtHmac) RefreshToken(tokenString string, opt ...jwt.ParserOption) (string, error)
+func (j *JwtHmac) RefreshTokenContext(ctx context.Context, tokenString string, opt ...jwt.ParserOption) (string, error)
 func (j *JwtEd25519) RefreshToken(tokenString string, opt ...jwt.ParserOption) (string, error)
+func (j *JwtEd25519) RefreshTokenContext(ctx context.Context, tokenString string, opt ...jwt.ParserOption) (string, error)
 func (j *JwtRSA) RefreshToken(tokenString string, opt ...jwt.ParserOption) (string, error)
+func (j *JwtRSA) RefreshTokenContext(ctx context.Context, tokenString string, opt ...jwt.ParserOption) (string, error)
 ```
 
 行为说明：
@@ -727,6 +765,10 @@ _ = newToken
 func (j *JwtHmac) ParallelVerify(tokens []string, opt ...jwt.ParserOption) ([]*claims.Claims, []error)
 func (j *JwtEd25519) ParallelVerify(tokens []string, opt ...jwt.ParserOption) ([]*claims.Claims, []error)
 func (j *JwtRSA) ParallelVerify(tokens []string, opt ...jwt.ParserOption) ([]*claims.Claims, []error)
+
+func (j *JwtHmac) ParallelVerifyContext(ctx context.Context, tokens []string, opt ...jwt.ParserOption) ([]*claims.Claims, []error)
+func (j *JwtEd25519) ParallelVerifyContext(ctx context.Context, tokens []string, opt ...jwt.ParserOption) ([]*claims.Claims, []error)
+func (j *JwtRSA) ParallelVerifyContext(ctx context.Context, tokens []string, opt ...jwt.ParserOption) ([]*claims.Claims, []error)
 ```
 
 行为说明：
@@ -735,6 +777,7 @@ func (j *JwtRSA) ParallelVerify(tokens []string, opt ...jwt.ParserOption) ([]*cl
 - 内部使用有界 worker pool，而不是为每个 token 单独起 goroutine
 - 默认最大并发数为 `min(len(tokens), runtime.GOMAXPROCS(0))`
 - `results[i]` 与 `errs[i]` 对应同一个输入 token
+- `ParallelVerifyContext` 会在 `ctx` 取消后停止分发未开始的任务，并将 ctx 透传给 context-aware 黑名单检查函数
 
 注意事项：
 
@@ -798,6 +841,14 @@ import (
 func IssueToken(t gojwt.Tokener, uid int64) (string, error) {
     // 调用方不用关心底层是 HMAC、Ed25519 还是 RSA。
     return t.GenerateToken(uid, claims.WithPrv("admin"))
+}
+```
+
+需要 context 取消能力时，可按需断言扩展接口：
+
+```go
+if ct, ok := t.(gojwt.ContextTokener); ok {
+    return ct.ParseTokenContext(ctx, token)
 }
 ```
 
@@ -1196,7 +1247,6 @@ if err != nil {
 不太适合：
 
 - 基本每次请求都是不同 token
-- 需要严格容量淘汰策略的场景
 
 ### 4. `RefreshToken` 适合 Access Token 临期续签
 
@@ -1212,9 +1262,9 @@ if err != nil {
 
 因为当前设计只允许“接近过期时刷新”，避免客户端在 token 刚发下来时就不断刷新。
 
-### 为什么 `CachedParseToken` 不做严格容量限制
+### `CachedParseToken` 如何控制内存增长
 
-当前实现定位是轻量封装，只做实例级缓存和惰性清扫。如果你需要 TTL + LRU + 容量上限，可以在外层自己做缓存包装。
+当前实现默认限制最多缓存 `4096` 条，并通过 LRU 淘汰和 token 过期时间惰性清扫控制内存增长。可通过 `WithCacheMaxEntries(n)` 调整容量，传 `0` 可关闭缓存路径。
 
 ### 为什么黑名单不直接内置 Redis
 
@@ -1240,6 +1290,10 @@ go test -race ./...
 # 查看测试覆盖率
 go test -coverprofile=coverage.out ./...
 go tool cover -func=coverage.out
+
+# 运行 fuzz 冒烟测试
+go test -run=^$ -fuzz=FuzzJwtHmacParseToken -fuzztime=5s .
+go test -run=^$ -fuzz=FuzzPEMKeyParsers -fuzztime=5s .
 
 # 运行 Example 测试
 go test -run Example ./... -v
