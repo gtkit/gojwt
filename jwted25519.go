@@ -58,7 +58,7 @@ func (j *JwtEd25519) GenerateToken(uid int64, options ...claims.Option) (string,
 		return "", ErrJWTNotInit
 	}
 	return generateTokenImpl(&j.config, uid, options, func(cc *claims.Claims) (string, error) {
-		return createEd25519Token(*cc, j.privateKey)
+		return createEd25519Token(*cc, j.privateKey, j.keyID)
 	})
 }
 
@@ -71,7 +71,7 @@ func (j *JwtEd25519) RefreshToken(tokenString string, opt ...jwtv5.ParserOption)
 		return "", ErrJWTNotInit
 	}
 	return refreshTokenImplContext(context.Background(), &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return createEd25519Token(*cc, j.privateKey)
+		return createEd25519Token(*cc, j.privateKey, j.keyID)
 	})
 }
 
@@ -81,7 +81,7 @@ func (j *JwtEd25519) RefreshTokenContext(ctx context.Context, tokenString string
 		return "", ErrJWTNotInit
 	}
 	return refreshTokenImplContext(ctx, &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return createEd25519Token(*cc, j.privateKey)
+		return createEd25519Token(*cc, j.privateKey, j.keyID)
 	})
 }
 
@@ -137,8 +137,9 @@ func (j *JwtEd25519) ParallelVerifyContext(ctx context.Context, tokens []string,
 }
 
 // createEd25519Token 使用 EdDSA 签名并返回 token 字符串。
-func createEd25519Token(claims claims.Claims, signKey any) (string, error) {
-	return jwtv5.NewWithClaims(jwtv5.SigningMethodEdDSA, claims).SignedString(signKey)
+// keyID 非空时写入 header 的 kid。
+func createEd25519Token(claims claims.Claims, signKey any, keyID string) (string, error) {
+	return signToken(jwtv5.SigningMethodEdDSA, claims, keyID, signKey)
 }
 
 // readEd25519PrivateKey 从 PEM 文件读取 Ed25519 私钥。

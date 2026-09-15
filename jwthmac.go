@@ -50,7 +50,7 @@ func (j *JwtHmac) GenerateToken(uid int64, options ...claims.Option) (string, er
 		return "", ErrJWTNotInit
 	}
 	return generateTokenImpl(&j.config, uid, options, func(cc *claims.Claims) (string, error) {
-		return createHmacToken(*cc, j.secretKey, j.signingMethod)
+		return createHmacToken(*cc, j.secretKey, j.signingMethod, j.keyID)
 	})
 }
 
@@ -63,7 +63,7 @@ func (j *JwtHmac) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (s
 		return "", ErrJWTNotInit
 	}
 	return refreshTokenImplContext(context.Background(), &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return createHmacToken(*cc, j.secretKey, j.signingMethod)
+		return createHmacToken(*cc, j.secretKey, j.signingMethod, j.keyID)
 	})
 }
 
@@ -73,7 +73,7 @@ func (j *JwtHmac) RefreshTokenContext(ctx context.Context, tokenString string, o
 		return "", ErrJWTNotInit
 	}
 	return refreshTokenImplContext(ctx, &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return createHmacToken(*cc, j.secretKey, j.signingMethod)
+		return createHmacToken(*cc, j.secretKey, j.signingMethod, j.keyID)
 	})
 }
 
@@ -130,8 +130,9 @@ func (j *JwtHmac) ParallelVerifyContext(ctx context.Context, tokens []string, op
 }
 
 // createHmacToken 使用指定的 HMAC-SHA 签名算法并返回 token 字符串。
-func createHmacToken(claims claims.Claims, signKey any, signingMethod *jwtv5.SigningMethodHMAC) (string, error) {
-	return jwtv5.NewWithClaims(signingMethod, claims).SignedString(signKey)
+// keyID 非空时写入 header 的 kid。
+func createHmacToken(claims claims.Claims, signKey any, signingMethod *jwtv5.SigningMethodHMAC, keyID string) (string, error) {
+	return signToken(signingMethod, claims, keyID, signKey)
 }
 
 func resolveHMACSigningMethod(method *jwtv5.SigningMethodHMAC, configured bool) (*jwtv5.SigningMethodHMAC, error) {

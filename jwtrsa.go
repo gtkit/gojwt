@@ -106,7 +106,7 @@ func (j *JwtRSA) GenerateToken(uid int64, options ...claims.Option) (string, err
 		return "", ErrJWTNotInit
 	}
 	return generateTokenImpl(&j.config, uid, options, func(cc *claims.Claims) (string, error) {
-		return jwtv5.NewWithClaims(j.signingMethod, cc).SignedString(j.privateKey)
+		return signToken(j.signingMethod, cc, j.keyID, j.privateKey)
 	})
 }
 
@@ -119,7 +119,7 @@ func (j *JwtRSA) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (st
 		return "", ErrJWTNotInit
 	}
 	return refreshTokenImplContext(context.Background(), &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return jwtv5.NewWithClaims(j.signingMethod, cc).SignedString(j.privateKey)
+		return signToken(j.signingMethod, cc, j.keyID, j.privateKey)
 	})
 }
 
@@ -129,7 +129,7 @@ func (j *JwtRSA) RefreshTokenContext(ctx context.Context, tokenString string, op
 		return "", ErrJWTNotInit
 	}
 	return refreshTokenImplContext(ctx, &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return jwtv5.NewWithClaims(j.signingMethod, cc).SignedString(j.privateKey)
+		return signToken(j.signingMethod, cc, j.keyID, j.privateKey)
 	})
 }
 

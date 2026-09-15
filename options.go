@@ -37,6 +37,10 @@ type config struct {
 	// 默认使用 RS256，可显式切换到 RS384 / RS512 / PS256 / PS384 / PS512。
 	rsaSigningMethod jwtv5.SigningMethod
 	rsaSigningSet    bool
+
+	// keyID 写入 JWT header 的 kid 字段，标识本实例使用的密钥。
+	// 为空时不写入 kid，保持与旧版本一致的 header。
+	keyID string
 }
 
 // Option 配置 JwtHmac / JwtEd25519 实例的选项函数。
@@ -116,6 +120,25 @@ func WithBlacklistCheckFunc(fn func(tokenID string) (bool, error)) Option {
 func WithBlacklistCheckContextFunc(fn func(ctx context.Context, tokenID string) (bool, error)) Option {
 	return func(c *config) {
 		c.blacklistCheckContextFunc = fn
+	}
+}
+
+// WithKeyID 设置签发时写入 JWT header 的 kid 字段。
+//
+// kid 用于让验证方在多个密钥中定位到本 token 使用的那一个，
+// 典型场景是密钥轮换期新旧密钥并存，以及网关侧按 kid 选择验签密钥。
+// 不设置或设置为空字符串时不写入 kid，header 与旧版本保持一致。
+//
+// kid 只是密钥标识，会以明文出现在 token 里，不要放密钥本身或任何敏感信息。
+//
+// 使用示例：
+//
+//	j, err := gojwt.NewJwtHmac(secret, gojwt.WithKeyID("app-2026"))
+//
+// 签出的 token header 为 {"alg":"HS256","kid":"app-2026","typ":"JWT"}。
+func WithKeyID(kid string) Option {
+	return func(c *config) {
+		c.keyID = kid
 	}
 }
 

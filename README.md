@@ -45,6 +45,7 @@ Go 生态中已经有了 `github.com/golang-jwt/jwt/v5` 这样优秀的底层 JW
 - 支持缓存解析 `CachedParseToken`
 - 支持带 context 的解析、刷新、缓存解析和批量并发验签
 - 提供并发安全内存黑名单
+- 支持写入 `kid`，便于密钥轮换与网关侧按 kid 选密钥
 - 提供统一接口 `Tokener`
 - 错误统一为 sentinel error，便于 `errors.Is`
 
@@ -541,6 +542,48 @@ _ = j
 - 默认值为 `5 秒`
 - 会同时作用于 `exp`、`nbf`、`iat`
 - 如果你希望严格按时间字段校验，可显式传 `gojwt.WithParseLeeway(0)`
+
+### `WithKeyID`
+
+用于在签发时把密钥标识写入 JWT header 的 `kid` 字段。
+
+```go
+// 签出的 token header 为 {"alg":"HS256","kid":"app-2026","typ":"JWT"}
+j, err := gojwt.NewJwtHmac(
+    []byte("12345678901234567890123456789012"),
+    gojwt.WithKeyID("app-2026"),
+)
+if err != nil {
+    panic(err)
+}
+_ = j
+```
+
+说明：
+
+- 默认不写入 `kid`，header 与不使用本选项时完全一致
+- 传空字符串等价于不设置
+- `HMAC`、`Ed25519`、`RSA` 三种实现都支持，`RefreshToken` 产出的新 token 同样带上 `kid`
+- `kid` 只是密钥标识，会以明文出现在 token 里，不要放密钥本身或任何敏感信息
+
+两个典型用途：
+
+**密钥轮换**。新旧密钥并存期间，验证方靠 `kid` 知道该用哪一把，不必停机切换：
+
+```go
+// 轮换期：新签发的 token 用新密钥，老 token 仍带着老 kid 在有效期内正常使用
+oldJwt, _ := gojwt.NewJwtHmac(oldSecret, gojwt.WithKeyID("app-2025"))
+newJwt, _ := gojwt.NewJwtHmac(newSecret, gojwt.WithKeyID("app-2026"))
+```
+
+**网关侧预校验**。网关按 `kid` 在多个密钥中定位，同一个网关可以同时接收不同算法签发的 token：
+
+```go
+hmacJwt, _ := gojwt.NewJwtHmac(secret, gojwt.WithKeyID("app-2026"))
+rsaJwt, _  := gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithKeyID("rs-2026"))
+```
+
+不写 `kid` 时，网关只能配一个默认密钥，因而只能接收一种算法的 token。
 
 ### `WithBlacklistCheckFunc`
 

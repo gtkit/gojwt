@@ -501,3 +501,13 @@ func parallelVerifyImplContext(ctx context.Context, tokens []string, opt []jwtv5
 		return parseFn(ctx, token, opt...)
 	})
 }
+
+// signToken 用指定算法签发 token，keyID 非空时写入 header 的 kid。
+// 三种签名实现共用此函数，保证 kid 的写入时机与格式一致。
+func signToken(method jwtv5.SigningMethod, tokenClaims jwtv5.Claims, keyID string, signKey any) (string, error) {
+	token := jwtv5.NewWithClaims(method, tokenClaims)
+	if keyID != "" {
+		token.Header["kid"] = keyID
+	}
+	return token.SignedString(signKey)
+}

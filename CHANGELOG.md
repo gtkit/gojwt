@@ -5,7 +5,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [v1.0.4] - 2026-06-15
+## [v1.0.6] - 2026-09-15
+
+### Added
+
+- `WithKeyID`：签发时把密钥标识写入 JWT header 的 `kid` 字段，
+  支持密钥轮换与网关侧按 `kid` 选择验签密钥。
+  `JwtHmac` / `JwtEd25519` / `JwtRSA` 三种实现均生效，`RefreshToken` 产出的新 token 同样携带。
+  不设置时 header 保持原样，对既有调用方无影响。
+- `WithKeyID` 的测试覆盖三种签名实现的签发与刷新路径、向后兼容（未设置与空串均不写 kid）、
+  需要 JSON 转义的 kid 取值，以及与 `WithHMACSigningMethod` 共存
+
+## [v1.0.5] - 2026-06-15
 
 ### Added
 
@@ -28,6 +39,14 @@
 
 - `CachedParseToken` 在高基数 token 场景下不再无上限增长
 - `ParallelVerify` 相关并发实现支持取消后的快速退出
+
+## [v1.0.4] - 2026-06-15
+
+### Changed
+
+- `JwtHmac` / `JwtEd25519` / `JwtRSA` 的签发、解析、刷新逻辑抽象为共用实现，三种签名方式行为一致
+- `helpers.go` 补充共用的 token 生成与解析辅助函数
+- `doc.go` 补充包级文档，README 重写使用说明
 
 ## [v1.0.3] - 2025-04-10
 
@@ -105,6 +124,8 @@
 - 内存黑名单基础实现 `Blacklist`
 - sentinel error 体系
 
+[v1.0.6]: https://github.com/gtkit/gojwt/compare/v1.0.5...v1.0.6
+[v1.0.5]: https://github.com/gtkit/gojwt/compare/v1.0.4...v1.0.5
 [v1.0.4]: https://github.com/gtkit/gojwt/compare/v1.0.3...v1.0.4
 [v1.0.3]: https://github.com/gtkit/gojwt/compare/v1.0.2...v1.0.3
 [v1.0.2]: https://github.com/gtkit/gojwt/compare/v1.0.1...v1.0.2
