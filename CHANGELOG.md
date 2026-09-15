@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.0.7] - 2026-09-15
+
+### Added
+
+- `ParseKeyID`：不验签地读出 token header 中的 `kid`，用于在验签前定位该用哪一把密钥。
+  token 未携带 `kid` 时返回空字符串和 nil error；签名被篡改或 token 已过期时同样能读出。
+  格式错误返回的错误满足 `errors.Is(err, ErrTokenMalformed)`。
+  返回值来自未经验证的数据，只能用于挑选密钥，随后须用选中的密钥走一次 `ParseToken` 验签。
+
+### Changed
+
+- 测试依赖 `stretchr/testify` 升级到 v1.12.1
+- README 的 `WithKeyID` 段落补上验证侧流程：密钥轮换与网关侧预校验两个示例
+  均给出按 `kid` 选密钥后再验签的完整代码
+
 ## [v1.0.6] - 2026-09-15
 
 ### Added
@@ -124,6 +139,7 @@
 - 内存黑名单基础实现 `Blacklist`
 - sentinel error 体系
 
+[v1.0.7]: https://github.com/gtkit/gojwt/compare/v1.0.6...v1.0.7
 [v1.0.6]: https://github.com/gtkit/gojwt/compare/v1.0.5...v1.0.6
 [v1.0.5]: https://github.com/gtkit/gojwt/compare/v1.0.4...v1.0.5
 [v1.0.4]: https://github.com/gtkit/gojwt/compare/v1.0.3...v1.0.4

@@ -3,10 +3,13 @@ package gojwt
 import (
 	"container/list"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -510,4 +513,43 @@ func signToken(method jwtv5.SigningMethod, tokenClaims jwtv5.Claims, keyID strin
 		token.Header["kid"] = keyID
 	}
 	return token.SignedString(signKey)
+}
+
+// ParseKeyID 从 token 中取出 header 的 kid，用于在验签前定位该用哪一把密钥。
+// token 未携带 kid 时返回空字符串和 nil error。
+//
+// 本函数不验证签名，也不校验 claims 时效，只对 header 段做 base64 与 JSON 解码。
+// 返回的 kid 因此来自未经验证的数据，调用方可以用它挑选密钥，
+// 但必须再用选中的密钥走一次 ParseToken 完成验签，
+// 不能拿它直接做任何鉴权或授权判断。
+//
+// 使用示例：
+//
+//	kid, err := gojwt.ParseKeyID(tokenString)
+//	if err != nil {
+//	    return err
+//	}
+//	j, ok := jwtByKeyID[kid]
+//	if !ok {
+//	    return gojwt.ErrInvalidKey
+//	}
+//	cc, err := j.ParseToken(tokenString) // 验签在这一步完成
+func ParseKeyID(tokenString string) (string, error) {
+	// 只取 header 段：为读一个 kid 去解码整份 claims 既有额外开销，
+	// 又会让 claims 的格式问题传导成"读不到 kid"。
+	dot := strings.IndexByte(tokenString, '.')
+	if dot <= 0 {
+		return "", ErrTokenMalformed
+	}
+	headerJSON, err := base64.RawURLEncoding.DecodeString(tokenString[:dot])
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrTokenMalformed, err)
+	}
+	var header struct {
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrTokenMalformed, err)
+	}
+	return header.Kid, nil
 }

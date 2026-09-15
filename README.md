@@ -45,7 +45,7 @@ Go 生态中已经有了 `github.com/golang-jwt/jwt/v5` 这样优秀的底层 JW
 - 支持缓存解析 `CachedParseToken`
 - 支持带 context 的解析、刷新、缓存解析和批量并发验签
 - 提供并发安全内存黑名单
-- 支持写入 `kid`，便于密钥轮换与网关侧按 kid 选密钥
+- 支持写入与读取 `kid`，便于密钥轮换与网关侧按 kid 选密钥
 - 提供统一接口 `Tokener`
 - 错误统一为 sentinel error，便于 `errors.Is`
 
@@ -566,6 +566,8 @@ _ = j
 - `HMAC`、`Ed25519`、`RSA` 三种实现都支持，`RefreshToken` 产出的新 token 同样带上 `kid`
 - `kid` 只是密钥标识，会以明文出现在 token 里，不要放密钥本身或任何敏感信息
 
+验证侧用 `ParseKeyID` 读出 `kid` 来定位密钥，见下一节。
+
 两个典型用途：
 
 **密钥轮换**。新旧密钥并存期间，验证方靠 `kid` 知道该用哪一把，不必停机切换：
@@ -574,6 +576,22 @@ _ = j
 // 轮换期：新签发的 token 用新密钥，老 token 仍带着老 kid 在有效期内正常使用
 oldJwt, _ := gojwt.NewJwtHmac(oldSecret, gojwt.WithKeyID("app-2025"))
 newJwt, _ := gojwt.NewJwtHmac(newSecret, gojwt.WithKeyID("app-2026"))
+
+verifiers := map[string]*gojwt.JwtHmac{
+    "app-2025": oldJwt,
+    "app-2026": newJwt,
+}
+
+// 验证方：先按 kid 选密钥，再用选中的实例验签
+kid, err := gojwt.ParseKeyID(tokenString)
+if err != nil {
+    return err
+}
+j, ok := verifiers[kid]
+if !ok {
+    return gojwt.ErrInvalidKey
+}
+cc, err := j.ParseToken(tokenString)
 ```
 
 **网关侧预校验**。网关按 `kid` 在多个密钥中定位，同一个网关可以同时接收不同算法签发的 token：
@@ -581,9 +599,40 @@ newJwt, _ := gojwt.NewJwtHmac(newSecret, gojwt.WithKeyID("app-2026"))
 ```go
 hmacJwt, _ := gojwt.NewJwtHmac(secret, gojwt.WithKeyID("app-2026"))
 rsaJwt, _  := gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithKeyID("rs-2026"))
+
+// 两种算法签发的 token 走同一个入口，靠 kid 分流到对应实例
+verifiers := map[string]gojwt.Tokener{
+    "app-2026": hmacJwt,
+    "rs-2026":  rsaJwt,
+}
+
+kid, err := gojwt.ParseKeyID(tokenString)
+if err != nil {
+    return err
+}
+j, ok := verifiers[kid]
+if !ok {
+    return gojwt.ErrInvalidKey
+}
+cc, err := j.ParseToken(tokenString)
 ```
 
-不写 `kid` 时，网关只能配一个默认密钥，因而只能接收一种算法的 token。
+### `ParseKeyID`
+
+不验签地读出 token header 中的 `kid`，用于在验签前定位该用哪一把密钥。
+
+```go
+kid, err := gojwt.ParseKeyID(tokenString)
+```
+
+说明：
+
+- token 未携带 `kid` 时返回空字符串和 `nil` error
+- 只对 header 段做 base64 与 JSON 解码，签名被篡改或 token 已过期时同样能读出 `kid`
+- 格式错误（缺少分隔符、header 段不是合法 base64 或合法 JSON 对象）返回的错误
+  满足 `errors.Is(err, gojwt.ErrTokenMalformed)`
+- 返回的 `kid` 来自未经验证的数据，攻击者可控。它只能用来挑选密钥，
+  随后必须用选中的密钥走一次 `ParseToken` 完成验签，不能直接用于鉴权或授权判断
 
 ### `WithBlacklistCheckFunc`
 
