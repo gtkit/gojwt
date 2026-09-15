@@ -1,5 +1,7 @@
 .idea/
+.vscode/
+.DS_Store
 .Ds_Store
-.harness/
-CLAUDE.md
-AGENTS.md
+*.test
+*.out
+coverage.html
