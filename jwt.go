@@ -1,6 +1,7 @@
 package gojwt
 
 import (
+	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
@@ -78,6 +79,24 @@ func GenerateRSAKeys(priPath, pubPath string, bits int) error {
 	return writeKeyPairPEM(priPath, pubPath, privateKey, &privateKey.PublicKey)
 }
 
+// GenerateECDSAKeys 生成 ES256/ES384/ES512 对应曲线的 ECDSA PEM 密钥对。
+// algorithm 留空使用 ES256；私钥 PKCS8、0600，公钥 PKIX、0644。
+// 不覆盖已有文件；目标存在时保留原文件并返回 fs.ErrExist。
+func GenerateECDSAKeys(priPath, pubPath, algorithm string) error {
+	if algorithm == "" {
+		algorithm = "ES256"
+	}
+	curve, err := ecdsaCurveForAlgorithm(algorithm)
+	if err != nil {
+		return err
+	}
+	key, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate ECDSA key: %w", err)
+	}
+	return writeKeyPairPEM(priPath, pubPath, key, &key.PublicKey)
+}
+
 // writeKeyPairPEM 把密钥对编码为 PKCS8 / PKIX PEM 并以独占方式写入两个文件。
 // 先创建两个文件再写入：第二个文件已存在时删除第一个刚创建的空文件，不留半套密钥。
 func writeKeyPairPEM(priPath, pubPath string, privateKey, publicKey any) error {
@@ -93,15 +112,15 @@ func writeKeyPairPEM(priPath, pubPath string, privateKey, publicKey any) error {
 	if err := os.MkdirAll(filepath.Dir(priPath), 0o700); err != nil {
 		return fmt.Errorf("create private key dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(pubPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(pubPath), 0o755); err != nil { // #nosec G301 -- This directory holds public keys; private key directories use 0700.
 		return fmt.Errorf("create public key dir: %w", err)
 	}
 
-	priFile, err := os.OpenFile(priPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	priFile, err := os.OpenFile(priPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- The caller supplies key paths; request-derived paths must be validated by the application.
 	if err != nil {
 		return fmt.Errorf("create private key file: %w", err)
 	}
-	pubFile, err := os.OpenFile(pubPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	pubFile, err := os.OpenFile(pubPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) // #nosec G304 G302 -- Caller-supplied key path; public keys are intentionally readable. Private keys use 0600.
 	if err != nil {
 		_ = priFile.Close()
 		_ = os.Remove(priPath)
@@ -146,7 +165,7 @@ func decodePEMBlock(data []byte) (*pem.Block, error) {
 
 // parseKeyFile 读取密钥文件并交给对应的 PEM 解析函数，读取失败时保留 fs 错误链并带上路径。
 func parseKeyFile[K any](path string, parse func([]byte) (K, error)) (K, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- Key paths come from application configuration; the caller validates request-derived paths.
 	if err != nil {
 		var zero K
 		return zero, fmt.Errorf("read key file %q: %w", path, err)

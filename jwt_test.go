@@ -752,7 +752,7 @@ func TestCachedParseTokenDoesNotCacheClaimsValidationBypass(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = j.CachedParseToken(token, jwtv5.WithoutClaimsValidation())
-	require.NoError(t, err)
+	require.ErrorIs(t, err, gojwt.ErrTokenNotValidYet)
 
 	_, err = j.CachedParseToken(token)
 	require.ErrorIs(t, err, gojwt.ErrTokenNotValidYet)

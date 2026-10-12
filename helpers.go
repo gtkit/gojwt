@@ -3,7 +3,6 @@ package gojwt
 import (
 	"container/list"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -134,7 +133,7 @@ func refreshTokenClaims(tokenClaims *claims.Claims, cfg *config) error {
 		return ErrRefreshTooEarly
 	}
 
-	lifetime := tokenClaims.ExpiresAt.Time.Sub(tokenClaims.IssuedAt.Time)
+	lifetime := tokenClaims.ExpiresAt.Sub(tokenClaims.IssuedAt.Time)
 	if lifetime <= 0 {
 		lifetime = cfg.tokenDuration
 	}
@@ -250,7 +249,10 @@ func checkRevocation(ctx context.Context, cfg *config, tokenClaims *claims.Claim
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if cfg.blacklistCheck != nil && tokenClaims.TokenID != "" {
+	if cfg.blacklistCheck != nil {
+		if strings.TrimSpace(tokenClaims.TokenID) == "" {
+			return fmt.Errorf("%w: jti or token_id is required for blacklist checks", ErrTokenRequiredClaimMissing)
+		}
 		revoked, err := cfg.blacklistCheck(ctx, tokenClaims.TokenID)
 		if err != nil {
 			return fmt.Errorf("check token blacklist: %w", err)
@@ -259,8 +261,11 @@ func checkRevocation(ctx context.Context, cfg *config, tokenClaims *claims.Claim
 			return ErrTokenBlacklisted
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if cfg.revocationCheck != nil {
-		revoked, err := cfg.revocationCheck(ctx, tokenClaims)
+		revoked, err := cfg.revocationCheck(ctx, cloneClaims(tokenClaims))
 		if err != nil {
 			return fmt.Errorf("check token revocation: %w", err)
 		}
@@ -268,7 +273,7 @@ func checkRevocation(ctx context.Context, cfg *config, tokenClaims *claims.Claim
 			return ErrTokenBlacklisted
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 // cloneClaims 对 Claims 进行深拷贝，防止缓存被调用方意外修改。
@@ -282,6 +287,7 @@ func cloneClaims(src *claims.Claims) *claims.Claims {
 	dst.Roles = slices.Clone(src.Roles)
 	dst.AuthTime = cloneNumericDate(src.AuthTime)
 	dst.Ext = cloneExtMap(src.Ext)
+	dst.Custom = cloneExtMap(src.Custom)
 	return &dst
 }
 
@@ -455,7 +461,7 @@ func generateTokenImpl(cfg *config, uid int64, options []claims.Option, signFn f
 // 默认要求 exp 存在并校验 iat，本包签发的 token 天然满足。
 // keyFunc 由具体实现提供（获取验签密钥并验证算法）。
 func parseTokenImplContext(ctx context.Context, cfg *config, tokenString string, opt []jwtv5.ParserOption, keyFunc func(*jwtv5.Token) (any, error), expectedAlg string) (*claims.Claims, error) {
-	if tokenString == "" {
+	if tokenString == "" || len(tokenString) > MaxTokenBytes {
 		return nil, ErrTokenMalformed
 	}
 	if ctx == nil {
@@ -465,30 +471,44 @@ func parseTokenImplContext(ctx context.Context, cfg *config, tokenString string,
 		return nil, err
 	}
 
-	parserOptions := make([]jwtv5.ParserOption, 0, 4+len(cfg.parserOptions)+len(opt))
-	parserOptions = append(parserOptions,
-		jwtv5.WithValidMethods([]string{expectedAlg}),
-		jwtv5.WithLeeway(cfg.parseLeeway),
-		jwtv5.WithExpirationRequired(),
-		jwtv5.WithIssuedAt(),
-	)
-	parserOptions = append(parserOptions, cfg.parserOptions...)
-	parserOptions = append(parserOptions, opt...)
-	token, err := jwtv5.ParseWithClaims(tokenString, &claims.Claims{}, func(token *jwtv5.Token) (any, error) {
+	if _, err := readTokenHeader(tokenString); err != nil {
+		return nil, err
+	}
+	parserOptions := validationOptions(cfg, opt)
+	parserOptions = append(parserOptions, jwtv5.WithValidMethods([]string{expectedAlg}), jwtv5.WithStrictDecoding(), jwtv5.WithoutClaimsValidation())
+	if err := validateTokenPayload(tokenString, parserOptions); err != nil {
+		return nil, err
+	}
+	c := &claims.Claims{}
+	parsed := &strictTokenClaims{Claims: c, allowNumericSubject: cfg.numericSubject}
+	method, err := verificationMethod(expectedAlg)
+	if err != nil {
+		return nil, err
+	}
+	token, err := jwtv5.ParseWithClaims(tokenString, parsed, func(token *jwtv5.Token) (any, error) {
 		if token.Method == nil || token.Method.Alg() != expectedAlg {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
+		token.Method = method
 		return keyFunc(token)
 	}, parserOptions...)
 	if err != nil {
 		return nil, normalizeParseError(err)
 	}
 
-	c, ok := token.Claims.(*claims.Claims)
-	if !ok || !token.Valid {
+	if !token.Valid {
 		return nil, ErrTokenInvalid
 	}
+	if err := jwtv5.NewValidator(validationOptions(cfg, opt)...).Validate(c); err != nil {
+		return nil, normalizeParseError(err)
+	}
+	if err := finalizeTokenIdentifiers(c); err != nil {
+		return nil, err
+	}
 
+	if err := checkClaimsValidator(ctx, cfg, c); err != nil {
+		return nil, err
+	}
 	if err := checkRevocation(ctx, cfg, c); err != nil {
 		return nil, err
 	}
@@ -514,7 +534,7 @@ func refreshTokenImplContext(ctx context.Context, cfg *config, tokenString strin
 // cachedParseTokenImplContext 是 CachedParseTokenContext 的通用实现。
 // parseFn 由具体实现提供，通常指向具体类型的 ParseTokenContext。
 func cachedParseTokenImplContext(ctx context.Context, cfg *config, cache *claimsCache, tokenString string, opt []jwtv5.ParserOption, parseFn func(context.Context, string, ...jwtv5.ParserOption) (*claims.Claims, error)) (*claims.Claims, error) {
-	if tokenString == "" {
+	if tokenString == "" || len(tokenString) > MaxTokenBytes {
 		return nil, ErrTokenMalformed
 	}
 	if ctx == nil {
@@ -528,6 +548,12 @@ func cachedParseTokenImplContext(ctx context.Context, cfg *config, cache *claims
 	}
 
 	if c, ok := loadCachedClaims(cache, tokenString); ok {
+		if err := jwtv5.NewValidator(validationOptions(cfg, nil)...).Validate(c); err != nil {
+			return nil, normalizeParseError(err)
+		}
+		if err := checkClaimsValidator(ctx, cfg, c); err != nil {
+			return nil, err
+		}
 		if err := checkRevocation(ctx, cfg, c); err != nil {
 			return nil, err
 		}
@@ -543,11 +569,18 @@ func cachedParseTokenImplContext(ctx context.Context, cfg *config, cache *claims
 	return tokenClaims, nil
 }
 
-// parallelVerifyImpl 是 ParallelVerify 的通用实现。
-func parallelVerifyImpl(tokens []string, opt []jwtv5.ParserOption, parseFn func(string, ...jwtv5.ParserOption) (*claims.Claims, error)) ([]*claims.Claims, []error) {
-	return parallelVerifyImplContext(context.Background(), tokens, opt, func(_ context.Context, token string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
-		return parseFn(token, opt...)
-	})
+// checkClaimsValidator 把应用校验与吊销检查分开，并隔离回调可修改的 claims。
+func checkClaimsValidator(ctx context.Context, cfg *config, tokenClaims *claims.Claims) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if cfg.claimsValidator == nil {
+		return nil
+	}
+	if err := cfg.claimsValidator(ctx, cloneClaims(tokenClaims)); err != nil {
+		return fmt.Errorf("%w: claims validator: %w", ErrTokenInvalidClaims, err)
+	}
+	return nil
 }
 
 // parallelVerifyImplContext 是 ParallelVerifyContext 的通用实现。
@@ -558,7 +591,7 @@ func parallelVerifyImplContext(ctx context.Context, tokens []string, opt []jwtv5
 }
 
 // signToken 用指定算法签发 token，keyID 非空时写入 header 的 kid。
-// 三种签名实现共用此函数，保证 kid 的写入时机与格式一致。
+// 四种签名实现共用此函数，保证 kid 的写入时机与格式一致。
 func signToken(method jwtv5.SigningMethod, tokenClaims jwtv5.Claims, keyID string, signKey any) (string, error) {
 	token := jwtv5.NewWithClaims(method, tokenClaims)
 	if keyID != "" {
@@ -590,19 +623,24 @@ func signToken(method jwtv5.SigningMethod, tokenClaims jwtv5.Claims, keyID strin
 func ParseKeyID(tokenString string) (string, error) {
 	// 只取 header 段：为读一个 kid 去解码整份 claims 既有额外开销，
 	// 又会让 claims 的格式问题传导成"读不到 kid"。
-	dot := strings.IndexByte(tokenString, '.')
-	if dot <= 0 {
-		return "", ErrTokenMalformed
-	}
-	headerJSON, err := base64.RawURLEncoding.DecodeString(tokenString[:dot])
+	header, err := readTokenHeader(tokenString)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", ErrTokenMalformed, err)
+		return "", err
 	}
-	var header struct {
-		Kid string `json:"kid"`
+	return keyIDFromHeader(header)
+}
+
+func keyIDFromHeader(header map[string]json.RawMessage) (string, error) {
+	rawKID, ok := header["kid"]
+	if !ok {
+		return "", nil
 	}
-	if err := json.Unmarshal(headerJSON, &header); err != nil {
-		return "", fmt.Errorf("%w: %w", ErrTokenMalformed, err)
+	var kid *string
+	if err := json.Unmarshal(rawKID, &kid); err != nil {
+		return "", fmt.Errorf("%w: invalid kid: %w", ErrTokenMalformed, err)
 	}
-	return header.Kid, nil
+	if kid == nil {
+		return "", fmt.Errorf("%w: kid must be a string", ErrTokenMalformed)
+	}
+	return *kid, nil
 }

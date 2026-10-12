@@ -25,8 +25,13 @@ type Claims struct {
 	// RefreshToken 产出的新 token 原样继承此值，刷新链以它加 refreshDuration 为终点。
 	AuthTime *jwtv5.NumericDate `json:"auth_time,omitempty"`
 	// Ext 业务扩展字段，例如 tenant_id、device_id。
-	// 值经 JSON 往返后整数会变成 float64，读取时用 ExtInt64 / ExtString。
+	// gojwt 解析入口把所有数值保留为 json.Number，防止解析和刷新时丢失精度。
+	// 直接 json.Unmarshal 的类型规则由调用方控制，读取时用 ExtInt64 / ExtString。
 	Ext map[string]any `json:"ext,omitempty"`
+
+	// Custom 保存验签后的未知顶层业务字段；数值使用 json.Number 保持精度。
+	// 签发时按顶层输出，不能覆盖标准字段、uid、token_id 等已有字段。
+	Custom map[string]any `json:"-"`
 }
 
 // Option 是签发 token 时附加 Claims 字段的选项函数。

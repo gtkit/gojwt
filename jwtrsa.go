@@ -76,6 +76,9 @@ func newJwtRSA(privateKey *rsa.PrivateKey, publicKey *rsa.PublicKey, options []O
 	if cfg.hmacSigningSet {
 		return nil, fmt.Errorf("%w: HMAC signing method option is not applicable to RSA", ErrInvalidConfig)
 	}
+	if cfg.ecdsaSigningSet {
+		return nil, fmt.Errorf("%w: ECDSA signing method option is not applicable to RSA", ErrInvalidConfig)
+	}
 	signingMethod, err := resolveRSASigningMethod(cfg.rsaSigningMethod, cfg.rsaSigningSet)
 	if err != nil {
 		return nil, err
@@ -85,9 +88,6 @@ func newJwtRSA(privateKey *rsa.PrivateKey, publicKey *rsa.PublicKey, options []O
 	j.publicKey, err = cloneRSAPublicKey(publicKey)
 	if err != nil {
 		return nil, err
-	}
-	if bits := j.publicKey.N.BitLen(); bits < minRSAKeyBits {
-		return nil, fmt.Errorf("%w: RSA key must be at least %d bits, got %d", ErrInvalidConfig, minRSAKeyBits, bits)
 	}
 	if privateKey == nil {
 		return j, nil
@@ -152,7 +152,9 @@ func (j *JwtRSA) ParseTokenContext(ctx context.Context, tokenString string, opt 
 	if j == nil {
 		return nil, ErrJWTNotInit
 	}
-	return parseTokenImplContext(ctx, &j.config, tokenString, opt, func(_ *jwtv5.Token) (any, error) {
+	return parseTokenImplContext(ctx, &j.config, tokenString, opt, func(token *jwtv5.Token) (any, error) {
+		// ParseWithClaims 原先从全局注册表选方法；这里覆盖为本实例的严格副本。
+		token.Method = j.signingMethod
 		return j.publicKey, nil
 	}, j.signingMethod.Alg())
 }
@@ -256,31 +258,14 @@ func ParseRSAPublicKeyPEM(data []byte) (*rsa.PublicKey, error) {
 // resolveRSASigningMethod 解析 RSA 签名算法配置，默认 RS256。
 func resolveRSASigningMethod(method jwtv5.SigningMethod, configured bool) (jwtv5.SigningMethod, error) {
 	if !configured {
-		return jwtv5.SigningMethodRS256, nil
+		method = jwtv5.SigningMethodRS256
 	}
-	if method == nil {
-		return nil, fmt.Errorf("%w: RSA signing method must not be nil", ErrInvalidConfig)
-	}
-
-	switch method.Alg() {
-	case jwtv5.SigningMethodRS256.Alg(),
-		jwtv5.SigningMethodRS384.Alg(),
-		jwtv5.SigningMethodRS512.Alg(),
-		jwtv5.SigningMethodPS256.Alg(),
-		jwtv5.SigningMethodPS384.Alg(),
-		jwtv5.SigningMethodPS512.Alg():
-		return method, nil
-	default:
-		return nil, fmt.Errorf("%w: unsupported RSA signing method %q", ErrInvalidConfig, method.Alg())
-	}
+	return strictPSSSigningMethod(method)
 }
 
 func cloneRSAPublicKey(key *rsa.PublicKey) (*rsa.PublicKey, error) {
-	if key == nil {
-		return nil, fmt.Errorf("%w: RSA public key must not be nil", ErrInvalidKey)
-	}
-	if key.N == nil {
-		return nil, fmt.Errorf("%w: RSA public key modulus must not be nil", ErrInvalidKey)
+	if err := validateRSAPublicKey(key); err != nil {
+		return nil, err
 	}
 	return &rsa.PublicKey{
 		N: new(big.Int).Set(key.N),
@@ -289,8 +274,8 @@ func cloneRSAPublicKey(key *rsa.PublicKey) (*rsa.PublicKey, error) {
 }
 
 func cloneRSAPrivateKey(key *rsa.PrivateKey) (*rsa.PrivateKey, error) {
-	if key.D == nil {
-		return nil, fmt.Errorf("%w: RSA private exponent must not be nil", ErrInvalidKey)
+	if key == nil || key.D == nil || key.D.Sign() <= 0 {
+		return nil, fmt.Errorf("%w: RSA private exponent must be positive", ErrInvalidKey)
 	}
 	if len(key.Primes) < 2 {
 		return nil, fmt.Errorf("%w: RSA private key must contain at least two primes", ErrInvalidKey)
@@ -306,8 +291,8 @@ func cloneRSAPrivateKey(key *rsa.PrivateKey) (*rsa.PrivateKey, error) {
 		Primes:    make([]*big.Int, len(key.Primes)),
 	}
 	for i, prime := range key.Primes {
-		if prime == nil {
-			return nil, fmt.Errorf("%w: RSA prime %d must not be nil", ErrInvalidKey, i)
+		if prime == nil || prime.Sign() <= 0 {
+			return nil, fmt.Errorf("%w: RSA prime %d must be positive", ErrInvalidKey, i)
 		}
 		clone.Primes[i] = new(big.Int).Set(prime)
 	}

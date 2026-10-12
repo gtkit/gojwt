@@ -28,7 +28,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26.2"
+          go-version-file: go.mod
           cache: true
 
       # 先下载依赖，后续 lint/test 可复用 module cache。
@@ -59,3 +59,5 @@ jobs:
         run: |
           go test -run=^$ -fuzz=FuzzJwtHmacParseToken -fuzztime=5s .
           go test -run=^$ -fuzz=FuzzPEMKeyParsers -fuzztime=5s .
+          go test -run=^$ -fuzz=FuzzSignedTokenPayload -fuzztime=5s .
+          go test -run=^$ -fuzz=FuzzParse -fuzztime=5s ./jwks

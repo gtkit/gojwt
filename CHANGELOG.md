@@ -5,9 +5,9 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [v1.1.0] - 2026-10-12
 
-> ⚠ 破坏性变更（均为 fail-closed，旧的危险行为改为显式报错并在错误信息中给出出路）：
+> ⚠ 安全校验收紧：以下旧行为改为返回错误，升级前须核对调用方配置与外部 token：
 >
 > - 构造期校验 `refreshDuration >= tokenDuration` 与 `0 < refreshWindow <= tokenDuration`，
 >   不满足返回 `ErrInvalidConfig`。此前 `refreshDuration` 在默认配置下从不生效，刷新链没有上界。
@@ -16,10 +16,29 @@
 > - `WithBlacklistFunc` / `WithBlacklistCheckFunc` / `WithBlacklistCheckContextFunc` 同时配置多个时返回 `ErrInvalidConfig`，
 >   此前静默只用其中一个。
 > - `GenerateEd25519Keys` / `GenerateRSAKeys` 不再覆盖已存在的密钥文件，返回满足 `errors.Is(err, fs.ErrExist)` 的错误。
-> - 删除从未被返回的 `ErrHashUnavailable`；引用它的代码需要删掉对应分支。
+> - 强制标准 claims 验证；拒绝不支持的 crit/b64、超长 JWT、冲突 jti/token_id 与非 JOSE PSS 盐长度。
+>
+> 本版保留 `github.com/gtkit/gojwt` 模块路径与已有公开方法签名，无需修改 import。
+> 升级到 Go 1.26.9 或更新受支持版本后，执行 `go get github.com/gtkit/gojwt@v1.1.0`。
+> 外部 token 须携带有效 `exp`，存在 `iat` 时不得晚于当前时间加 leeway；
+> `WithoutClaimsValidation` 不再跳过库的标准校验。刷新配置须满足上述时长约束，
+> 最长会话到期后重新登录；密钥生成使用新文件名。黑名单回调只配置一种，
+> 外部 `jti` 与 `token_id` 同时非空时必须一致，启用黑名单时必须提供可用标识。
+> 错误使用 `errors.Is` 判断，避免直接 `==` 比较包装后的错误。成功刷新会保留原 token 的
+> `exp - iat` 有效时长，并限制在会话终点内；此前刷新固定使用构造时的 `tokenDuration`。
+> 外部 token 的未知顶层字段会随刷新保留，请通过 claims 校验回调限制允许的业务字段。
 
 ### Added
 
+- `jwks`：RSA/EC/Ed25519 公钥 JWK/JWKS、不可变 Set、可替换 Publisher、受信 HTTPS Remote；大小限制、超时、取消、并发合并、未知 kid 节流及失败不延长 TTL。
+- `KeyResolver`、`KeyResolverFunc` 与 `NewVerifier`：显式算法白名单的第三方验签，动态密钥每次重验。
+- ECDSA ES256/384/512、内存/PEM 构造、公钥 verifier、PKCS#8/SEC1/PKIX 解析及密钥生成。
+- `WithNumericSubject` 可选兼容整数 sub；`Claims.Custom` 保留未知顶层字段。
+- `ParseBearerRequest` 拒绝重复 Authorization；Bearer 凭据按 RFC 6750 字符规则提取。
+
+- `WithClaimsValidator`：可选的应用 claims 校验回调，默认关闭；签名和标准 claims 校验后、
+  吊销检查前执行，缓存命中与并发解析同样执行。回调收到上下文和标准字段、JSON 容器的副本；
+  失败同时保留 `ErrTokenInvalidClaims` 与应用错误，多次配置使用最后一个值，nil 关闭。
 - 会话有界刷新：`claims.Claims.AuthTime`（`auth_time`）记录首次签发时刻并在刷新时继承；
   `RefreshToken` 以 `auth_time + refreshDuration` 为会话终点，到达终点返回新 sentinel `ErrRefreshExpired`，
   新 token 的 `exp` 不越过终点，并保留旧 token 的有效时长。无 `auth_time` 的旧 token 以 `iat` 作起点。
@@ -40,6 +59,13 @@
 
 ### Changed
 
+- Go 最低补丁版本更新为 1.26.9，CI 从 go.mod 读取，修复新增 HTTP/JWKS 路径命中的标准库漏洞。
+- JWT JSON 拒绝重复顶层字段、标准字段大小写别名与尾随内容；Ext 和 Custom 数值统一使用 json.Number，拒绝非规范 Base64URL 与非法 NumericDate。
+
+- `KeyRing` 零值可注册，单 token context 入口在解析 header 前检查取消；
+  按 kid 精确选键、同 kid 覆盖和空 kid 显式注册的已有行为保持不变。
+- `ParseKeyID` 拒绝 null header 和非字符串 kid；header 必须为对象。
+- Ed25519 密钥对构造核对私钥 seed 与尾部公钥一致，拒绝无法产生有效签名的损坏私钥。
 - nil receiver 的 `ParallelVerify` / `ParallelVerifyContext` 返回与输入等长、全部为 `ErrJWTNotInit` 的错误切片（此前返回 `nil, nil`，按下标读取会越界）。
 - 解析错误归一化时用 `%w` 同时包装 sentinel 与底层原因，`errors.Is` 判定不变，`err.Error()` 可见根因。
 - 密钥加载错误统一：PEM 解码失败、长度错误、结构解析失败满足 `errors.Is(err, ErrInvalidKey)`，
@@ -55,9 +81,11 @@
 
 - `GenerateSecureKeyString`：改用 `GenerateHMACKeyString`，它按算法生成足够长的密钥。
 
-### Removed
+### Fixed
 
-- `ErrHashUnavailable`。
+- 缓存命中按配置时钟重验标准 claims；外部 jti 参与撤销，Ext 大整数及 Custom 数值在解析/刷新时保持精度。
+- RSA 非法 N/E/D/因子被拒绝；PSS 使用实例级固定哈希长度盐；KeyRing 拒绝 typed-nil。
+- 恢复废弃 `ErrHashUnavailable` 符号以保留源码兼容。
 
 ## [v1.0.7] - 2026-09-15
 
@@ -193,6 +221,7 @@
 - 内存黑名单基础实现 `Blacklist`
 - sentinel error 体系
 
+[v1.1.0]: https://github.com/gtkit/gojwt/compare/v1.0.7...v1.1.0
 [v1.0.7]: https://github.com/gtkit/gojwt/compare/v1.0.6...v1.0.7
 [v1.0.6]: https://github.com/gtkit/gojwt/compare/v1.0.5...v1.0.6
 [v1.0.5]: https://github.com/gtkit/gojwt/compare/v1.0.4...v1.0.5

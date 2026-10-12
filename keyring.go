@@ -10,10 +10,12 @@ import (
 )
 
 // KeyRing 按 kid 汇集多个验签方：解析时用 ParseKeyID 取出 token 的 kid，再委托给对应的 Verifier 验签。
-// 空 kid 对应"未携带 kid 的 token"。KeyRing 实现 Verifier，可被多个 goroutine 并发使用。
+// 空 kid 对应"未携带 kid 的 token"。KeyRing 的零值可直接使用，
+// 实现 Verifier，可被多个 goroutine 并发使用；使用后不得复制。
 //
 // Register / Unregister 可在运行期调用，密钥轮换的典型流程是：
 // 先注册新 kid 的实例并让签发方切到新密钥，等旧 kid 签出的 token 全部过期后再注销旧 kid。
+// 已选中验签方的解析可以继续完成，后续解析使用新的注册状态。
 //
 //	ring := gojwt.NewKeyRing()
 //	_ = ring.Register("app-2025", oldJwt)
@@ -35,10 +37,13 @@ func (r *KeyRing) Register(kid string, v Verifier) error {
 	if r == nil {
 		return ErrJWTNotInit
 	}
-	if v == nil {
+	if isNilValue(v) {
 		return fmt.Errorf("%w: verifier for kid %q must not be nil", ErrInvalidConfig, kid)
 	}
 	r.mu.Lock()
+	if r.verifiers == nil {
+		r.verifiers = make(map[string]Verifier)
+	}
 	r.verifiers[kid] = v
 	r.mu.Unlock()
 	return nil
@@ -79,6 +84,12 @@ func (r *KeyRing) ParseTokenContext(ctx context.Context, tokenString string, opt
 	if r == nil {
 		return nil, ErrJWTNotInit
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	v, err := r.verifierFor(tokenString)
 	if err != nil {
 		return nil, err
@@ -95,6 +106,12 @@ func (r *KeyRing) CachedParseToken(tokenString string, opt ...jwtv5.ParserOption
 func (r *KeyRing) CachedParseTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	if r == nil {
 		return nil, ErrJWTNotInit
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	v, err := r.verifierFor(tokenString)
 	if err != nil {

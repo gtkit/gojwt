@@ -1,9 +1,10 @@
 # gojwt
 
-`gojwt` 是一个轻量、直接、面向生产使用的 JWT 工具库，支持以下三类签名方式：
+`gojwt` 是一个轻量、直接、面向生产使用的 JWT 工具库，支持以下四类签名方式：
 
 - `HMAC-SHA` 家族：默认 `HS256`，可选 `HS384`、`HS512`
 - `Ed25519` (EdDSA)
+- `ECDSA`：默认 `ES256`（P-256），可选 `ES384`（P-384）、`ES512`（P-521）
 - `RSA` 家族：默认 `RS256`，可选 `RS384`、`RS512`（PKCS1-v1_5）及 `PS256`、`PS384`、`PS512`（PSS）
 
 库中提供了统一的 Token 生成、解析、有界刷新、缓存解析、并发校验、密钥轮换、黑名单与用户级吊销等能力，
@@ -31,7 +32,7 @@ Go 生态中已经有了 `github.com/golang-jwt/jwt/v5` 这样优秀的底层 JW
 - ✅ 签发时自动生成 TokenID、写入时间字段与会话起点 `auth_time`、对齐 `jti`
 - ✅ 解析时自动检查黑名单与吊销回调、归一化错误、容忍时钟漂移、要求 `exp` 并校验 `iat`
 - ✅ 刷新时自动轮换 TokenID，会话以 `auth_time + refreshDuration` 为上界，旧 token 与新 token 独立可吊销
-- ✅ 提供统一接口 `Tokener` / `Verifier` / `Issuer`，HMAC / Ed25519 / RSA 切换只需改构造行
+- ✅ 提供统一接口 `Tokener` / `Verifier` / `Issuer`，HMAC / Ed25519 / RSA / ECDSA 切换只需改构造行
 - ✅ 只持公钥的验签实例与按 `kid` 选键的 `KeyRing`，验签方与密钥轮换在包内闭环
 - ✅ 内置并发安全缓存 + 有界 worker pool 并发验签
 - ✅ 提供完整的 sentinel error 体系，业务层用 `errors.Is` 一行判断，错误链保留底层原因
@@ -40,7 +41,7 @@ Go 生态中已经有了 `github.com/golang-jwt/jwt/v5` 这样优秀的底层 JW
 
 ## 特性
 
-- 支持 `HMAC-SHA` 家族、`Ed25519` 与 `RSA`（RS/PS 系列）
+- 支持 `HMAC-SHA`、`Ed25519`、`RSA`（RS/PS）与 `ECDSA`（ES）
 - 内置业务 Claims 结构，支持 `Ext` 扩展字段承载 tenant_id、device_id 等业务信息
 - 支持标准字段与业务字段混合签发
 - 支持临近过期时刷新 Token，刷新链以会话起点加最长会话时长为上界
@@ -48,19 +49,115 @@ Go 生态中已经有了 `github.com/golang-jwt/jwt/v5` 这样优秀的底层 JW
 - 支持带 context 的解析、刷新、缓存解析和批量并发验签
 - 提供只持公钥的验签实例，以及从内存密钥、PEM 字节构造实例的入口
 - 提供 `KeyRing`，按 `kid` 汇集多个验签方，密钥轮换期新旧密钥并存
+- 提供 `WithClaimsValidator`，应用规则在普通解析和缓存命中时统一执行
 - 提供并发安全内存黑名单，以及接收完整 claims 的吊销回调
 - 提供 `ParseBearerToken`，从 `Authorization` 头提取 token
 - 提供统一接口 `Tokener` / `Verifier` / `Issuer`
 - 错误统一为 sentinel error，便于 `errors.Is`
 
+## JWKS 与第三方 JWT（v1.1.0 起）
+
+安装 `v1.1.0` 或更新版本即可使用本节 API。
+`jwks` 子包提供公钥 JWK/JWKS 的编解码、发布与远程更新；`gojwt.KeyResolver` 可接入其他可信密钥来源。
+ECDSA 构造入口为 `NewJwtECDSA`、`NewJwtECDSAFromKeys`、`NewJwtECDSAVerifier` 和
+`NewJwtECDSAVerifierFromFile`。`WithECDSASigningMethod` 默认 ES256，支持 ES384/ES512，必须匹配曲线；
+私钥读取支持 PKCS#8/SEC1，公钥支持 PKIX，`GenerateECDSAKeys` 输出 PKCS#8/PKIX 且不覆盖已有文件。
+
+```go
+// endpoint 必须来自应用可信配置，不能取自 token 的 jku/x5u/iss 等未验证字段。
+remote, err := jwks.NewRemote(endpoint,
+    jwks.WithTTL(5*time.Minute),
+    jwks.WithTimeout(5*time.Second),
+    jwks.WithMinRefreshInterval(30*time.Second),
+)
+if err != nil { return err }
+// 启动时预热；服务启动上下文应带超时。
+if err := remote.Refresh(ctx); err != nil { return err }
+verifier, err := gojwt.NewVerifier(remote, []string{"RS256"},
+    gojwt.WithParserOptions(jwtv5.WithIssuer(expectedIssuer), jwtv5.WithAudience(expectedAudience)),
+)
+if err != nil { return err }
+cc, err := verifier.ParseTokenContext(ctx, rawToken)
+if err != nil { return err }
+_ = cc.Subject // 应用继续确认用户、租户及权限。
+```
+
+完整可运行示例见 `jwks/example_test.go`。本地公钥通过 `jwks.NewKey`、`jwks.NewSet` 组装，
+`jwks.NewPublisher(set)` 返回 HTTP handler；应用挂载路由并设置 HTTP server 超时。
+`Publisher.Replace` 原子替换整套公钥，验签服务通过远程 TTL 或显式 `Refresh` 获取更新。
+
+| 配置或边界 | 默认与约束 |
+|---|---|
+| `WithTTL` | 成功快照信任 5 分钟，必须大于零；失败不会延长有效期 |
+| `WithTimeout` | 每次抓取 5 秒，必须大于零；调用方更短的 deadline 同样生效 |
+| `WithMinRefreshInterval` | 未知 kid / 失败自动重试间隔 30 秒，必须大于零；显式 Refresh 绕过节流但合并并发抓取 |
+| `WithClient` | 默认独立 http.Client，复用 transport；复制注入的 client，禁用重定向和 Cookie，transport 须遵守取消 |
+| `WithClock` | 默认 time.Now，仅影响快照时效，函数须支持并发；网络超时仍用真实时间 |
+| 资源上限 | JWT 64 KiB；JWKS 1 MiB、128 把公钥、JSON 嵌套最多 32 层 |
+
+远程地址必须为可信 HTTPS，无 userinfo/fragment；仅发布 RSA、EC、Ed25519 公钥，拒绝私钥与 `oct` secret。
+`kid` 精确匹配；空 kid 仅匹配显式的空 ID，未知 kid 不遍历其他密钥。校验 `alg`、`kty`、曲线、`use` 与 `key_ops`。
+库不启动隐式后台协程：首次读取、TTL 到期或未知 kid 触发同步刷新，应用可自行调度带超时的 `Refresh`。
+取消发起者会使共享刷新失败；等待者可独立取消。刷新失败时已有快照只保留到原 TTL，过期后拒绝验签。
+轮换使用新 kid，先发布新旧公钥再换签发私钥；旧 token 的有效期及 leeway 结束后撤下旧公钥。
+紧急撤销必须考虑所有验证方的快照 TTL。动态 `TokenVerifier.CachedParseToken` 每次重新选键验签，避免已移除密钥继续通过签名缓存。
+
+### Laravel tymon/jwt-auth
+
+协议兼容取决于实际算法、密钥字节和 claims；已核对 `tymon/jwt-auth` 2.3.0 的 HS/RS/ES 算法配置，
+并以相同 JOSE 格式生成测试样本。尚未连接业务 Laravel 实例进行端到端测试。
+HS 系列使用同一份 secret 字节，RS/ES 使用 Laravel 私钥对应的公钥，并固定验签算法白名单。
+不要把 secret 文本擅自做 Base64 解码。默认 Laravel payload 没有 aud，要求 aud 时需在签发端添加；
+iss 也要与真实签发值一致，不能从待验证 token 动态反推信任配置。
+
+HS256 对接可直接使用已有 HMAC 实例（默认就是 HS256）：
+
+```go
+j, err := gojwt.NewJwtHmac([]byte(laravelSecret),
+    gojwt.WithNumericSubject(true), // 仅为兼容旧 Laravel 数字 sub；字符串也正常接受。
+)
+if err != nil { return err }
+cc, err := j.ParseTokenContext(ctx, rawToken)
+if err != nil { return err }
+_ = cc.Subject // Laravel sub；库不自动把它写入 UserID。
+_ = cc.TokenID // Laravel jti，可用于撤销检查。
+```
+
+`laravelSecret` 由应用安全配置提供，必须与 Laravel `JWT_SECRET` 的实际字节一致，HS256 至少 32 字节。
+应用有明确 issuer/audience 约定时追加 `WithParserOptions` 校验，数字 sub 开关与签名验证互不替代。
+HS256 使用共享 secret，JWKS 子包只管理非对称公钥，不对外发布 HMAC secret。
+可执行协议示例见 `laravel_example_test.go`；它使用独立的 HMAC-SHA256 标准库签名来模拟 Laravel compact JWT。
+
+- 默认 `sub` 必须为字符串；仅当旧签发方使用 JSON 整数时启用 `WithNumericSubject(true)`，精确保留整数文本。不会自动设置 `UserID`。
+- 标准 `jti` 会补入缺失的 `TokenID`，黑名单回调可直接查询；两者非空但不相等时拒绝。启用黑名单后，缺失或空白标识会拒绝，不能跳过检查。
+- 未知顶层字段保存在 `Claims.Custom`，数字为 `json.Number`，可用于验证 Laravel 的 `prv` 以外的附加字段。内置 `prv` 仍在 `Claims.Prv`。
+- `Custom` 随签发/刷新输出到顶层，禁止覆盖保留字段；gojwt 解析入口负责填充它，直接 `json.Unmarshal` 不会收集未知字段。
+- Laravel 黑名单的存储键、TTL 与撤销策略由应用适配；JWT 验签成功不表示 Go 已自动共享 Laravel 的登出状态。
+
+标准 claims 和签名验证始终执行，拒绝重复顶层成员、保留字段大小写别名、无效 UTF-8、尾随 JSON 及不支持的 `crit`/`b64` 扩展；PSS 盐长度固定为对应哈希长度。NumericDate 必须为 JSON 数字，支持 UTC 公历 0001 年到 9999 年；超范围拒绝以防日期内部溢出。
+`iss/aud/sub` 的期望值仍须应用明确配置。`RefreshToken` 是有界 JWT 续签，不提供 OAuth refresh token family/reuse detection。
+
+### 迁移与发布
+
+`v1.1.0` 保留 `github.com/gtkit/gojwt` 模块路径和已有公开方法签名，原有 import 无需修改。
+Go 最低补丁版本为 1.26.9。升级时须核对以下安全校验变化：
+
+- 外部 token 必须有有效 `exp`；存在 `iat` 时不得晚于当前时间加 leeway，`WithoutClaimsValidation` 不能关闭库的标准校验。
+- 刷新配置须满足 `refreshDuration >= tokenDuration` 和 `0 < refreshWindow <= tokenDuration`；会话到达 `auth_time + refreshDuration` 后须重新登录。
+- 密钥生成不覆盖已有文件；轮换时指定新文件名。JWT 头部扩展、JSON 和密钥材料必须满足本页列出的严格验证规则。
+- 黑名单回调只配置一种；启用黑名单时 token 必须有可用标识，`jti` 与 `token_id` 同时非空时必须一致。
+- 使用 `errors.Is` 判断错误。成功刷新保留原 token 的 `exp - iat` 有效时长并受会话上限约束；外部未知顶层字段也会保留，应在 claims 校验回调中核对业务字段。
+
+已恢复废弃的 `ErrHashUnavailable` 符号；正常调用不会返回它。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 环境要求
 
-- Go `1.26`
+- Go `1.26.9` 或更新受支持版本；生产构建必须使用含安全补丁的工具链。
 
 ## 安装
 
 ```bash
-go get github.com/gtkit/gojwt
+go get github.com/gtkit/gojwt@v1.1.0
 ```
 
 ## 适用场景
@@ -72,6 +169,30 @@ go get github.com/gtkit/gojwt
 - 对 token 做角色、业务域、过期时间、签发者、受众等校验
 - 用户改密、管理员踢下线等需要按用户维度吊销的场景
 - 一个简单直接、没有重型框架依赖的 JWT 封装
+
+## JWT 标准与校验边界
+
+单个服务在同一信任范围内签发和验签时，可以使用 `HS256` 和密码学随机密钥；
+多个服务只需验签时，可以使用 Ed25519 / RSA，让签发方保管私钥、验签方只持公钥。
+文件存储推荐 PKCS#8 私钥与 PKIX 公钥；库同时兼容原始 Ed25519 PEM。
+
+| 字段或能力 | 作用与使用条件 | gojwt 接线 |
+|---|---|---|
+| `kid` | JWS 标准中的可选密钥标识；多密钥并存时用于精确选键 | 签发配置 `WithKeyID`，验签使用 `KeyRing` |
+| 多密钥并存 | 轮换时保留旧公钥，让有效期内的旧 token 继续验签 | 注册新旧 verifier，旧 token 全部过期后注销旧 kid |
+| `iss` | 标识签发方，验证方配置自己信任的 issuer 与对应密钥 | 签发用 `claims.WithIssuer`，验签用 `WithParserOptions(jwtv5.WithIssuer(...))` |
+| `aud` | 标识目标应用；同一签发方服务多个应用时必须携带并校验 | 签发用 `claims.WithAudience`，验签用 `WithParserOptions(jwtv5.WithAudience(...))` |
+| `sub` | 字符串主体标识；应用确认该主体或 issuer-subject 组合有效 | 签发用 `claims.WithSubject`，应用通过 `WithClaimsValidator` 或验签后的身份查询确认 |
+
+标准依据：[RFC 7515 §4.1.4](https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.4)、
+[RFC 7517 §4.5](https://www.rfc-editor.org/rfc/rfc7517.html#section-4.5)、
+[RFC 8725 §3.8–3.9](https://www.rfc-editor.org/rfc/rfc8725.html#section-3.8)。
+
+`sub == strconv.FormatInt(uid, 10)`、租户归属和用户有效性属于应用约定，
+库不默认强制这些规则；`jti` 与 `token_id` 同时非空时必须一致。回调可执行应用所需的字段一致性检查；用户或租户查询由应用负责。
+无 kid 的旧 token 只有显式注册空 kid 的 verifier 才会被 KeyRing 接受；迁移截止时间也由应用控制。
+同 kid 再次注册会覆盖旧 verifier；轮换时应使用新的 kid 标识新的密钥材料。
+不要根据 token 的 `jku` / `x5u` 等字段去任意地址取密钥，KeyRing 只在本地注册集合内查找。
 
 ## 包结构
 
@@ -124,7 +245,7 @@ type Claims struct {
 
 ### 默认时长
 
-三种算法实现的默认值相同：
+四种算法实现的默认值相同：
 
 - `tokenDuration = 2 小时`：单个 token 的有效期
 - `refreshDuration = 7 天`：会话最长时长，从 `auth_time` 起算
@@ -632,9 +753,44 @@ _ = j
 
 说明：
 
-- 应用顺序为包内默认选项 → 实例级选项 → 单次调用传入的选项
+- 应用顺序为包内默认选项 → 实例级选项 → 单次调用选项；最终强制算法白名单、必填 `exp` 与时间校验，`WithoutClaimsValidation` 无法关闭验证
 - 实例级选项固定不变，`CachedParseToken` 的缓存对它仍然生效；单次调用传入的选项仍会绕过缓存
 - 适合把 issuer / audience 校验固定在实例上，避免每个调用点各写一遍
+
+### `WithClaimsValidator`
+
+用于注入应用的 claims 校验；默认不配置，`nil` 关闭回调，多次配置取最后一个值。
+以下示例采用应用约定：`sub` 必须是 `uid` 的十进制字符串。
+
+```go
+verifier, err := gojwt.NewJwtEd25519Verifier(publicKey,
+    gojwt.WithParserOptions(
+        jwtv5.WithIssuer("auth-center"),
+        jwtv5.WithAudience("chat-api"),
+    ),
+    gojwt.WithClaimsValidator(func(ctx context.Context, c *claims.Claims) error {
+        if err := ctx.Err(); err != nil {
+            return err
+        }
+        if c.Subject != strconv.FormatInt(c.UserID, 10) {
+            return gojwt.ErrTokenInvalidSubject
+        }
+        return nil
+    }),
+)
+if err != nil {
+    return err
+}
+_ = verifier
+```
+
+- 在签名和标准 claims 校验之后、黑名单与吊销检查之前执行；失败不会返回 claims。
+- `CachedParseToken` 命中时也重新执行，以便动态应用规则继续生效；并发验签同样执行。
+- 回调收到调用上下文和 claims 副本；标准字段及 JSON 解码的 Ext 容器（`map[string]any` / `[]any`）递归复制。
+  修改这些字段不会改变返回结果或缓存；应用自行注入的其他 Go 引用对象须只读。
+- 错误同时包装 `ErrTokenInvalidClaims` 与回调原错误，支持 `errors.Is` / `errors.As`。
+- 回调可能并发执行；外部查询应使用传入的 ctx，并设置应用自己的超时。
+- 单次 ParserOption 不会关闭此回调。ParserOption 本身由受信任代码提供，保持已有覆盖顺序。
 
 ### `WithKeyID`
 
@@ -656,7 +812,7 @@ _ = j
 
 - 默认不写入 `kid`，header 与不使用本选项时完全一致
 - 传空字符串等价于不设置
-- `HMAC`、`Ed25519`、`RSA` 三种实现都支持，`RefreshToken` 产出的新 token 同样带上 `kid`
+- `HMAC`、`Ed25519`、`RSA`、`ECDSA` 四种实现都支持，`RefreshToken` 产出的新 token 同样带上 `kid`
 - `kid` 只是密钥标识，会以明文出现在 token 里，不要放密钥本身或任何敏感信息
 
 验证侧用 `KeyRing` 按 `kid` 汇集多个实例，见下一节。
@@ -706,6 +862,7 @@ cc, err := ring.ParseToken(tokenString)
 说明：
 
 - `KeyRing` 实现 `Verifier`，`ParseToken` / `CachedParseToken` / `ParallelVerify` 及对应 context 变体都按 kid 逐个选键
+- `KeyRing` 零值也可注册；context 入口在解析 header 前检查取消。注册或注销不阻塞已委托的验签调用，已选中的调用允许完成
 - 空 kid 注册的实例用于未携带 `kid` 的 token
 - `kid` 未注册返回 `ErrUnknownKeyID`；token 格式错误返回 `ErrTokenMalformed`
 - 并发安全，`Register` / `Unregister` 可在运行期调用
@@ -721,6 +878,7 @@ kid, err := gojwt.ParseKeyID(tokenString)
 说明：
 
 - token 未携带 `kid` 时返回空字符串和 `nil` error
+- header 必须为 JSON 对象；`kid` 存在时必须为字符串，null 和其他类型返回 `ErrTokenMalformed`
 - 只对 header 段做 base64 与 JSON 解码，签名被篡改或 token 已过期时同样能读出 `kid`
 - 格式错误（缺少分隔符、header 段不是合法 base64 或合法 JSON 对象）返回的错误
   满足 `errors.Is(err, gojwt.ErrTokenMalformed)`
@@ -897,7 +1055,7 @@ func (j *JwtRSA) CachedParseTokenContext(ctx context.Context, tokenString string
 行为说明：
 
 - 首次解析时正常验签并缓存 Claims
-- 再次解析相同 token 时优先命中缓存，命中后仍执行黑名单检查与吊销回调
+- 再次解析相同 token 时优先命中缓存，命中后仍按配置时钟重验标准 claims，并执行应用校验、黑名单与吊销回调
 - 返回的是 Claims 副本（含 `Ext` 的嵌套结构），避免调用方意外改坏缓存对象
 - 仅在未传入单次调用 `ParserOption` 时使用缓存；构造期的 `WithParserOptions` 不影响缓存
 
@@ -1034,7 +1192,7 @@ if err := tokenClaims.VerifyPrv("admin"); err != nil {
 ### `ExtString` / `ExtInt64`
 
 ```go
-// 读取扩展字段。JSON 往返会把整数变成 float64，ExtInt64 会把它转回 int64。
+// 读取扩展字段。gojwt 解析后数值使用 json.Number 保留精度；ExtInt64 兼容签发侧整数与解析侧 json.Number。
 tenantID, ok := tokenClaims.ExtInt64("tenant_id")
 deviceID, ok := tokenClaims.ExtString("device_id")
 ```
@@ -1053,9 +1211,9 @@ fmt.Println("ttl:", ttl)
 
 三个接口按职责拆分，业务层按需要的能力选择：
 
-- `Tokener`：签发、解析、刷新、缓存解析、并发验签，三种签名实现都满足
-- `Verifier`：只有解析类方法（含 context 变体），三种签名实现与 `KeyRing` 都满足，验签方与网关面向它编程
-- `Issuer`：签发与刷新（含 context 变体），三种签名实现都满足
+- `Tokener`：签发、解析、刷新、缓存解析、并发验签，四种签名实现都满足
+- `Verifier`：只有解析类方法（含 context 变体），四种签名实现、`KeyRing` 与 `TokenVerifier` 都满足，验签方与网关面向它编程
+- `Issuer`：签发与刷新（含 context 变体），四种签名实现都满足
 
 ```go
 package main

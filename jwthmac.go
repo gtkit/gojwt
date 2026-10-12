@@ -27,8 +27,8 @@ func NewJwtHmac(secretKey []byte, options ...Option) (*JwtHmac, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.rsaSigningSet {
-		return nil, fmt.Errorf("%w: RSA signing method option is not applicable to HMAC", ErrInvalidConfig)
+	if cfg.rsaSigningSet || cfg.ecdsaSigningSet {
+		return nil, fmt.Errorf("%w: RSA/ECDSA signing method option is not applicable to HMAC", ErrInvalidConfig)
 	}
 
 	signingMethod, err := resolveHMACSigningMethod(cfg.hmacSigningMethod, cfg.hmacSigningSet)

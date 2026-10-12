@@ -23,7 +23,8 @@ type JwtEd25519 struct {
 }
 
 // NewJwtEd25519 从 PEM 文件加载 Ed25519 密钥对，创建 JWT 实例。
-// priPath 为 PKCS8 格式私钥路径，pubPath 为 PKIX 格式公钥路径；两者不匹配返回 ErrInvalidKey。
+// priPath 支持 PKCS8 或 64 字节原始格式私钥，pubPath 支持 PKIX 或 32 字节原始格式公钥。
+// 私钥内部不一致或两把密钥不匹配时返回 ErrInvalidKey。
 func NewJwtEd25519(priPath, pubPath string, options ...Option) (*JwtEd25519, error) {
 	privateKey, err := parseKeyFile(priPath, ParseEd25519PrivateKeyPEM)
 	if err != nil {
@@ -38,7 +39,8 @@ func NewJwtEd25519(priPath, pubPath string, options ...Option) (*JwtEd25519, err
 
 // NewJwtEd25519FromKeys 直接使用内存中的 Ed25519 密钥对创建 JWT 实例。
 // 适用于密钥来自 KMS、Vault、环境变量等外部系统的场景，PEM 字节可先用 ParseEd25519PrivateKeyPEM /
-// ParseEd25519PublicKeyPEM 解析。两把密钥不匹配返回 ErrInvalidKey。
+// ParseEd25519PublicKeyPEM 解析。输入密钥会被复制，构造后修改入参不影响实例。
+// 私钥内部不一致或两把密钥不匹配时返回 ErrInvalidKey。
 func NewJwtEd25519FromKeys(privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey, options ...Option) (*JwtEd25519, error) {
 	if len(privateKey) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("%w: Ed25519 private key must be %d bytes, got %d", ErrInvalidKey, ed25519.PrivateKeySize, len(privateKey))
@@ -65,8 +67,18 @@ func newJwtEd25519(privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey, o
 	if len(publicKey) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("%w: Ed25519 public key must be %d bytes, got %d", ErrInvalidKey, ed25519.PublicKeySize, len(publicKey))
 	}
-	if privateKey != nil && !publicKey.Equal(privateKey.Public()) {
-		return nil, fmt.Errorf("%w: Ed25519 private and public keys do not match", ErrInvalidKey)
+	if privateKey != nil {
+		if len(privateKey) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("%w: Ed25519 private key must be %d bytes, got %d", ErrInvalidKey, ed25519.PrivateKeySize, len(privateKey))
+		}
+		// PrivateKey.Public 只读取尾部公钥；从 seed 重新导出，才能发现尾部被替换的私钥。
+		derivedKey := ed25519.NewKeyFromSeed(privateKey[:ed25519.SeedSize])
+		if !privateKey.Equal(derivedKey) {
+			return nil, fmt.Errorf("%w: Ed25519 private key seed and public key do not match", ErrInvalidKey)
+		}
+		if !publicKey.Equal(derivedKey.Public()) {
+			return nil, fmt.Errorf("%w: Ed25519 private and public keys do not match", ErrInvalidKey)
+		}
 	}
 	cfg, err := newConfig(options...)
 	if err != nil {
@@ -75,8 +87,8 @@ func newJwtEd25519(privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey, o
 	if cfg.hmacSigningSet {
 		return nil, fmt.Errorf("%w: HMAC signing method option is not applicable to Ed25519", ErrInvalidConfig)
 	}
-	if cfg.rsaSigningSet {
-		return nil, fmt.Errorf("%w: RSA signing method option is not applicable to Ed25519", ErrInvalidConfig)
+	if cfg.rsaSigningSet || cfg.ecdsaSigningSet {
+		return nil, fmt.Errorf("%w: RSA/ECDSA signing method option is not applicable to Ed25519", ErrInvalidConfig)
 	}
 
 	return &JwtEd25519{

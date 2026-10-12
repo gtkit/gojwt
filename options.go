@@ -13,7 +13,7 @@ import (
 // token 有效期短于它时窗口取整段有效期。
 const defaultRefreshWindow = 5 * time.Minute
 
-// config 是 JwtHmac / JwtEd25519 / JwtRSA 的内部配置。
+// config 是 JwtHmac / JwtEd25519 / JwtRSA / JwtECDSA 的内部配置。
 type config struct {
 	tokenDuration    time.Duration
 	refreshDuration  time.Duration
@@ -24,6 +24,9 @@ type config struct {
 
 	// parserOptions 是实例级解析选项，在包内默认选项之后、单次调用选项之前应用。
 	parserOptions []jwtv5.ParserOption
+
+	// claimsValidator 在签名和标准 claims 校验后执行应用规则；nil 表示不附加校验。
+	claimsValidator func(ctx context.Context, tokenClaims *claims.Claims) error
 
 	// 三个黑名单 Option 各写各的字段，构造期校验互斥后归一到 blacklistCheck。
 	isBlacklisted             func(tokenID string) bool
@@ -47,9 +50,14 @@ type config struct {
 	// keyID 写入 JWT header 的 kid 字段，标识本实例使用的密钥。
 	// 为空时不写入 kid，保持与旧版本一致的 header。
 	keyID string
+
+	// numericSubject 只兼容旧签发方的整数 sub，不改变默认字符串校验。
+	numericSubject     bool
+	ecdsaSigningMethod *jwtv5.SigningMethodECDSA
+	ecdsaSigningSet    bool
 }
 
-// Option 配置 JwtHmac / JwtEd25519 / JwtRSA 实例的选项函数。
+// Option 配置 JwtHmac / JwtEd25519 / JwtRSA / JwtECDSA 实例的选项函数。
 type Option func(*config)
 
 // Options 是 Option 的类型别名，保留向后兼容。
@@ -113,7 +121,8 @@ func WithCacheMaxEntries(n int) Option {
 //	    jwtv5.WithAudience("web"),
 //	))
 //
-// 应用顺序为包内默认选项 → 实例级选项 → 单次调用传入的选项。
+// 应用顺序为默认 → 实例级 → 单次调用；最终强制算法白名单、必填 exp 与时间校验。
+// WithoutClaimsValidation 无法关闭这些校验；iss/aud/sub 仍由应用配置。
 // 实例级选项固定不变，CachedParseToken 的缓存对它仍然生效；单次调用选项仍会绕过缓存。
 func WithParserOptions(opts ...jwtv5.ParserOption) Option {
 	return func(c *config) {
@@ -125,10 +134,25 @@ func WithParserOptions(opts ...jwtv5.ParserOption) Option {
 	}
 }
 
+// WithClaimsValidator 注入应用的 claims 校验，例如主体与业务用户 ID 的一致性检查。
+//
+// 默认不执行额外校验；多次配置时使用最后一个值，nil 关闭回调。
+// 回调在签名和标准 claims 校验成功后、吊销检查前执行，缓存命中时同样执行。
+// 回调收到调用上下文和 claims 副本；标准字段及 JSON 解码的 Ext 容器递归复制。
+// 修改这些字段不影响返回结果或缓存；应用自行注入的其他 Go 引用对象须只读。
+// 返回错误时，解析错误同时包装 ErrTokenInvalidClaims 与原错误，供 errors.Is 判断。
+// 回调可能被并发调用；调用方负责其并发安全以及外部查询的取消和超时。
+func WithClaimsValidator(fn func(ctx context.Context, tokenClaims *claims.Claims) error) Option {
+	return func(c *config) {
+		c.claimsValidator = fn
+	}
+}
+
 // WithBlacklistFunc 注入外部黑名单检查函数。
 //
 // fn 接收 tokenID（即 Claims.TokenID / RegisteredClaims.ID），
 // 返回 true 表示该 token 已被拉黑，ParseToken / CachedParseToken 将返回 ErrTokenBlacklisted。
+// 启用黑名单后，缺失或空白的 jti/token_id 返回 ErrTokenRequiredClaimMissing。
 // 与 WithBlacklistCheckFunc、WithBlacklistCheckContextFunc 三者只能配置一个。
 //
 // 调用方可以注入任意实现，例如：
@@ -166,6 +190,7 @@ func WithBlacklistCheckContextFunc(fn func(ctx context.Context, tokenID string) 
 // WithRevocationCheck 注入接收完整 claims 的吊销回调。
 //
 // 回调在签名与 claims 校验通过、黑名单检查之后执行，CachedParseToken 缓存命中时同样执行。
+// 回调接收 claims 副本，修改不会影响验签结果或缓存；调用后再次检查上下文取消。
 // 返回 true 表示该 token 已被吊销，解析返回 ErrTokenBlacklisted；返回 error 时鉴权 fail closed。
 // 典型用法是用户级吊销，例如改密后让该用户在改密时刻之前签发的全部 token 作废：
 //
@@ -229,6 +254,24 @@ func defaultConfig() config {
 		parseLeeway:     5 * time.Second,
 		cacheMaxEntries: 4096,
 	}
+}
+
+// WithECDSASigningMethod 为 JwtECDSA 指定 ES256、ES384 或 ES512。
+// 默认 ES256；所选算法必须分别配合 P-256、P-384、P-521 密钥。
+// 不适用于 HMAC、RSA、Ed25519 或 resolver 验签器。
+func WithECDSASigningMethod(method *jwtv5.SigningMethodECDSA) Option {
+	return func(c *config) {
+		c.ecdsaSigningMethod = method
+		c.ecdsaSigningSet = true
+	}
+}
+
+// WithNumericSubject 兼容旧签发方把 sub 编码为 JSON 整数的行为。
+// 默认关闭，启用后将整数的精确十进制文本作为 Subject 校验；字符串保持不变，
+// 小数、null 和其他类型仍拒绝。它不自动映射 UserID，也不改变被验签的原始字节。
+// 多次配置时以后一次为准；新签发方应按 JWT 标准使用字符串 sub。
+func WithNumericSubject(enabled bool) Option {
+	return func(c *config) { c.numericSubject = enabled }
 }
 
 func newConfig(options ...Option) (config, error) {
