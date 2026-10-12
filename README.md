@@ -6,7 +6,8 @@
 - `Ed25519` (EdDSA)
 - `RSA` 家族：默认 `RS256`，可选 `RS384`、`RS512`（PKCS1-v1_5）及 `PS256`、`PS384`、`PS512`（PSS）
 
-库中提供了统一的 Token 生成、解析、刷新、缓存解析、并发校验、黑名单等能力，适合在 API 服务、后台服务、网关鉴权和内部 RPC 场景中使用。
+库中提供了统一的 Token 生成、解析、有界刷新、缓存解析、并发校验、密钥轮换、黑名单与用户级吊销等能力，
+适合在 API 服务、后台服务、网关鉴权和内部 RPC 场景中使用。
 
 ## 为什么封装 gojwt
 
@@ -20,33 +21,36 @@ Go 生态中已经有了 `github.com/golang-jwt/jwt/v5` 这样优秀的底层 JW
 解析 token 后要单独做黑名单检查、把 `golang-jwt` 的底层错误映射成业务层能理解的错误码、处理时钟漂移容忍时间。这些每次都得自己写。
 
 **刷新阶段：**
-刷新 token 时要重新生成 TokenID、重置 iat/nbf/exp、保证旧 token 被吊销后新 token 仍然可独立吊销——少做一步都是安全隐患。
+刷新 token 时要重新生成 TokenID、重置 iat/nbf/exp、保证旧 token 被吊销后新 token 仍然可独立吊销，还要给整条刷新链设一个上界，否则一个泄露的 token 可以被无限续下去。
 
-**算法切换：**
-如果你从 HMAC 切换到 Ed25519 或 RSA，ParseToken 中获取验签密钥的逻辑完全不同，GenerateToken 的签名方式也要改。没有统一抽象的话，改一次算法要动大量业务代码。
+**算法切换与密钥轮换：**
+如果你从 HMAC 切换到 Ed25519 或 RSA，ParseToken 中获取验签密钥的逻辑完全不同，GenerateToken 的签名方式也要改；密钥轮换期新旧密钥并存，验证方还得自己按 `kid` 选键。
 
 **gojwt 替你做了这些：**
 
-- ✅ 签发时自动生成 TokenID、写入时间字段、对齐 `jti`
-- ✅ 解析时自动检查黑名单、归一化错误、容忍时钟漂移
-- ✅ 刷新时自动轮换 TokenID，保证旧 token 与新 token 独立可吊销
-- ✅ 提供统一接口 `Tokener`，HMAC / Ed25519 / RSA 切换只需改构造行
+- ✅ 签发时自动生成 TokenID、写入时间字段与会话起点 `auth_time`、对齐 `jti`
+- ✅ 解析时自动检查黑名单与吊销回调、归一化错误、容忍时钟漂移、要求 `exp` 并校验 `iat`
+- ✅ 刷新时自动轮换 TokenID，会话以 `auth_time + refreshDuration` 为上界，旧 token 与新 token 独立可吊销
+- ✅ 提供统一接口 `Tokener` / `Verifier` / `Issuer`，HMAC / Ed25519 / RSA 切换只需改构造行
+- ✅ 只持公钥的验签实例与按 `kid` 选键的 `KeyRing`，验签方与密钥轮换在包内闭环
 - ✅ 内置并发安全缓存 + 有界 worker pool 并发验签
-- ✅ 提供完整的 sentinel error 体系，业务层用 `errors.Is` 一行判断
+- ✅ 提供完整的 sentinel error 体系，业务层用 `errors.Is` 一行判断，错误链保留底层原因
 
-**简单说：gojwt 让你只关心「谁、什么角色、能不能过」，不关心「怎么签名、怎么对齐、怎么吊销」。
+**简单说：gojwt 让你只关心「谁、什么角色、能不能过」，不关心「怎么签名、怎么对齐、怎么吊销」。**
 
 ## 特性
 
 - 支持 `HMAC-SHA` 家族、`Ed25519` 与 `RSA`（RS/PS 系列）
-- 内置业务 Claims 结构
+- 内置业务 Claims 结构，支持 `Ext` 扩展字段承载 tenant_id、device_id 等业务信息
 - 支持标准字段与业务字段混合签发
-- 支持临近过期时刷新 Token
+- 支持临近过期时刷新 Token，刷新链以会话起点加最长会话时长为上界
 - 支持缓存解析 `CachedParseToken`
 - 支持带 context 的解析、刷新、缓存解析和批量并发验签
-- 提供并发安全内存黑名单
-- 支持写入与读取 `kid`，便于密钥轮换与网关侧按 kid 选密钥
-- 提供统一接口 `Tokener`
+- 提供只持公钥的验签实例，以及从内存密钥、PEM 字节构造实例的入口
+- 提供 `KeyRing`，按 `kid` 汇集多个验签方，密钥轮换期新旧密钥并存
+- 提供并发安全内存黑名单，以及接收完整 claims 的吊销回调
+- 提供 `ParseBearerToken`，从 `Authorization` 头提取 token
+- 提供统一接口 `Tokener` / `Verifier` / `Issuer`
 - 错误统一为 sentinel error，便于 `errors.Is`
 
 ## 环境要求
@@ -61,25 +65,19 @@ go get github.com/gtkit/gojwt
 
 ## 适用场景
 
-### 什么时候适合用这个库
-
-- 你需要在 Go 服务里快速接入 JWT
-- 你希望在 `HMAC`、`Ed25519` 和 `RSA` 之间自由切换
-- 你需要对 token 做角色、业务域、过期时间等校验
-- 你需要一个简单直接、没有重型框架依赖的 JWT 封装
-
-### 什么时候不适合
-
-- 你需要分布式黑名单同步
-- 你需要超大规模、强约束的本地缓存淘汰策略
-- 你需要 OAuth2 / OIDC 全套协议能力
-
-这类需求通常应交给 Redis、外部鉴权中心或更完整的身份系统来处理。
+- 在 Go 服务里快速接入 JWT 签发与验签
+- 在 `HMAC`、`Ed25519` 和 `RSA` 之间自由切换
+- 只持公钥的服务或网关验签授权中心签出的 token
+- 密钥轮换期新旧密钥并存，按 `kid` 自动选键
+- 对 token 做角色、业务域、过期时间、签发者、受众等校验
+- 用户改密、管理员踢下线等需要按用户维度吊销的场景
+- 一个简单直接、没有重型框架依赖的 JWT 封装
 
 ## 包结构
 
 ```text
 gojwt/
+├── bearer.go         # Authorization 头解析
 ├── blacklist.go      # 并发安全黑名单
 ├── error.go          # 主包错误定义
 ├── helpers.go        # 缓存、错误归一化、刷新逻辑
@@ -87,6 +85,7 @@ gojwt/
 ├── jwted25519.go     # Ed25519 实现
 ├── jwthmac.go        # HMAC 实现
 ├── jwtrsa.go         # RSA 实现（RS/PS 系列）
+├── keyring.go        # 按 kid 选键的 KeyRing
 ├── options.go        # 构造 Option
 ├── tokener.go        # 统一接口
 └── claims/
@@ -104,10 +103,12 @@ gojwt/
 type Claims struct {
     jwt.RegisteredClaims
 
-    UserID  int64    `json:"uid"`
-    Prv     string   `json:"prv,omitempty"`
-    Roles   []string `json:"roles,omitzero"`
-    TokenID string   `json:"token_id"`
+    UserID   int64            `json:"uid"`
+    Prv      string           `json:"prv,omitempty"`
+    Roles    []string         `json:"roles,omitzero"`
+    TokenID  string           `json:"token_id"`
+    AuthTime *jwt.NumericDate `json:"auth_time,omitempty"`
+    Ext      map[string]any   `json:"ext,omitempty"`
 }
 ```
 
@@ -117,31 +118,36 @@ type Claims struct {
 - `Prv`：业务域标识，例如 `admin`、`app`、`open-api`
 - `Roles`：角色集合
 - `TokenID`：唯一 Token ID；默认自动生成，并与 JWT 标准字段 `jti` 保持一致
+- `AuthTime`：会话起点，即首次签发（登录）的时刻，对应 OIDC 的 `auth_time`；刷新时原样继承
+- `Ext`：业务扩展字段，例如 `tenant_id`、`device_id`；用 `ExtString` / `ExtInt64` 读取
 - `RegisteredClaims`：JWT 标准字段，如 `exp`、`iat`、`nbf`、`iss`、`sub`
 
 ### 默认时长
 
-两种算法实现的默认值相同：
+三种算法实现的默认值相同：
 
-- `tokenDuration = 2 小时`
-- `refreshDuration = 7 天`
+- `tokenDuration = 2 小时`：单个 token 的有效期
+- `refreshDuration = 7 天`：会话最长时长，从 `auth_time` 起算
+- `refreshWindow = 5 分钟`：距过期不足此时长才允许刷新；token 有效期短于 5 分钟时窗口等于整段有效期
 - `parseLeeway = 5 秒`
 - `cacheMaxEntries = 4096`
 
-可以通过构造时的 Option 修改。
+可以通过构造时的 Option 修改。构造函数会校验 `refreshDuration >= tokenDuration` 与
+`0 < refreshWindow <= tokenDuration`，不满足时返回 `ErrInvalidConfig` 并在错误信息中指出该改哪个 Option。
 
 ### Refresh 规则
 
-`RefreshToken` 的行为不是“随时可刷新”，而是“进入刷新窗口后才允许刷新”。
+`RefreshToken` 的行为是"进入刷新窗口后才允许刷新，且整条刷新链有上界"。
 
 当前规则：
 
-- token 距离签发时间超过 `refreshDuration`，返回 `ErrTokenExpired`
-- token 距离过期时间仍大于等于 `5 分钟`，返回 `ErrRefreshTooEarly`
-- 只有在离过期不足 `5 分钟` 时，才允许刷新
-- 刷新成功后会生成新的 `TokenID/jti`，并重置 `iat`、`nbf`，旧新 token 可独立吊销
+- 会话终点为 `auth_time + refreshDuration`；到达终点后刷新返回 `ErrRefreshExpired`，用户需要重新登录
+- token 距离过期时间仍大于 `refreshWindow`（默认 5 分钟），返回 `ErrRefreshTooEarly`
+- 刷新成功后生成新的 `TokenID/jti`，重置 `iat`、`nbf`，`auth_time` 原样继承
+- 新 token 保留旧 token 的有效时长（`exp - iat`），但 `exp` 不会越过会话终点
+- 升级前签发的 token 没有 `auth_time`，刷新时以其 `iat` 作为会话起点
 
-这非常适合 Access Token 的”临期续签”模型。
+这非常适合 Access Token 的"临期续签"模型：客户端每次临期续签，续到会话终点为止。
 
 ## 快速开始
 
@@ -153,6 +159,7 @@ package main
 import (
     "errors"
     "fmt"
+    "os"
     "time"
 
     jwtv5 "github.com/golang-jwt/jwt/v5"
@@ -162,9 +169,12 @@ import (
 
 func main() {
     // ========== 密钥准备 ==========
-    // HS512 要求密钥至少 64 字节。建议使用 GenerateSecureKeyString() 生成随机密钥，
+    // 密钥长度必须满足算法要求：HS256 至少 32 字节，HS384 至少 48 字节，HS512 至少 64 字节。
+    // 用 GenerateHMACKeyString 一次性生成后写入环境变量或配置中心，
     // 不要用手写简单口令——它们熵不够，容易被暴力枚举。
-    secret := []byte("1234567890123456789012345678901234567890123456789012345678901234")
+    //
+    //   s, _ := gojwt.GenerateHMACKeyString(jwtv5.SigningMethodHS512) // 86 字符，直接 []byte(s) 即可
+    secret := []byte(os.Getenv("JWT_SECRET"))
 
     // ========== 创建实例 ==========
     // NewJwtHmac 接受密钥和可选的配置 Option。
@@ -175,7 +185,7 @@ func main() {
         gojwt.WithHMACSigningMethod(jwtv5.SigningMethodHS512),
         // Access Token 有效期：2 小时。
         gojwt.WithTokenDuration(2*time.Hour),
-        // Refresh 总窗口：7 天。超过这个时间，即使 token 未过期也不再允许刷新。
+        // 会话最长 7 天：从首次签发起，刷新最多把会话延续到 7 天后。
         gojwt.WithRefreshDuration(7*24*time.Hour),
     )
     if err != nil {
@@ -184,31 +194,34 @@ func main() {
 
     // ========== 签发 Token ==========
     // GenerateToken 必须传用户 ID，还可通过 claims.Option 附加业务字段。
-    // 系统会自动生成唯一 TokenID、设置 exp/iat/nbf、对齐 jti。
+    // 系统会自动生成唯一 TokenID、设置 exp/iat/nbf/auth_time、对齐 jti。
     token, err := j.GenerateToken(
-        10001,                          // 用户 ID
-        claims.WithPrv("admin"),        // 业务域：控制后台
+        10001,                                // 用户 ID
+        claims.WithPrv("admin"),              // 业务域：控制后台
         claims.WithRoles("admin", "finance"), // 角色：管理员 + 财务
-        claims.WithIssuer("gtkit-auth"), // 签发者
+        claims.WithIssuer("gtkit-auth"),      // 签发者
         claims.WithSubject("access-token"),   // 主题
+        claims.WithExt("tenant_id", 42),      // 业务扩展字段
     )
     if err != nil {
         panic(err)
     }
 
     // ========== 解析 Token ==========
-    // ParseToken 会自动完成：签名验证、时间字段校验（默认容忍 5s 时钟漂移）、
-    // 黑名单检查（如果配置了的话）。
+    // ParseToken 会自动完成：签名验证、时间字段校验（默认容忍 5s 时钟漂移，要求 exp 存在并校验 iat）、
+    // 黑名单与吊销回调检查（如果配置了的话）。
     tokenClaims, err := j.ParseToken(token)
     if err != nil {
         panic(err)
     }
 
     // 读取 Claims 中的业务字段。
-    fmt.Println("uid:", tokenClaims.UserID)       // 10001
-    fmt.Println("tokenID:", tokenClaims.TokenID)   // 自动生成的 16 字节随机 ID
-    fmt.Println("prv:", tokenClaims.Prv)           // admin
-    fmt.Println("roles:", tokenClaims.Roles)       // [admin finance]
+    fmt.Println("uid:", tokenClaims.UserID)      // 10001
+    fmt.Println("tokenID:", tokenClaims.TokenID) // 自动生成的 16 字节随机 ID
+    fmt.Println("prv:", tokenClaims.Prv)         // admin
+    fmt.Println("roles:", tokenClaims.Roles)     // [admin finance]
+    tenantID, _ := tokenClaims.ExtInt64("tenant_id")
+    fmt.Println("tenant:", tenantID) // 42
 
     // ========== 校验角色和业务域 ==========
     // Claims 提供了内置的辅助方法，一行完成校验。
@@ -222,13 +235,17 @@ func main() {
     }
 
     // ========== 刷新 Token ==========
-    // RefreshToken 只在「token 距过期不足 5 分钟」时允许执行。
-    // 这是为了防止客户端无限刷新同一个 token。
+    // RefreshToken 只在「token 距过期不足刷新窗口」时允许执行，且不会把会话续到 auth_time + 7 天之后。
     newToken, err := j.RefreshToken(token)
     if err != nil {
-        if errors.Is(err, gojwt.ErrRefreshTooEarly) {
-            // 业务上可以告诉调用方：token 仍然有效，还没到刷新窗口。
+        switch {
+        case errors.Is(err, gojwt.ErrRefreshTooEarly):
+            // token 仍然有效，还没到刷新窗口。
             fmt.Println("当前还没到刷新窗口")
+            return
+        case errors.Is(err, gojwt.ErrRefreshExpired):
+            // 会话已到最长时长，让用户重新登录。
+            fmt.Println("会话已到期，请重新登录")
             return
         }
         panic(err)
@@ -246,7 +263,9 @@ func main() {
 package main
 
 import (
+    "errors"
     "fmt"
+    "io/fs"
     "path/filepath"
 
     "github.com/gtkit/gojwt"
@@ -260,14 +279,14 @@ func main() {
     priPath := filepath.Join("cert", "jwt_ed25519.pem")     // 私钥路径
     pubPath := filepath.Join("cert", "jwt_ed25519.pub.pem") // 公钥路径
 
-    // 首次部署时生成 Ed25519 密钥对文件。
-    // 私钥文件权限 0600，公钥文件权限 0644。
-    if err := gojwt.GenerateEd25519Keys(priPath, pubPath); err != nil {
+    // 首次部署时生成 Ed25519 密钥对文件，私钥文件权限 0600，公钥文件权限 0644。
+    // 文件已存在时返回 fs.ErrExist 且不会覆盖，后续启动据此跳过。
+    if err := gojwt.GenerateEd25519Keys(priPath, pubPath); err != nil && !errors.Is(err, fs.ErrExist) {
         panic(err)
     }
 
     // ========== 加载密钥对 ==========
-    // 从 PEM 文件加载私钥和公钥。私钥负责签名，公钥负责验签。
+    // 从 PEM 文件加载私钥和公钥。私钥负责签名，公钥负责验签；两者不匹配时构造失败。
     j, err := gojwt.NewJwtEd25519(priPath, pubPath)
     if err != nil {
         panic(err)
@@ -277,17 +296,20 @@ func main() {
     // 使用私钥签名。接口与 HMAC 完全一致。
     token, err := j.GenerateToken(
         20001,
-        claims.WithPrv("open-api"),    // 业务域：开放 API
-        claims.WithRoles("service"),   // 角色：服务调用
+        claims.WithPrv("open-api"),  // 业务域：开放 API
+        claims.WithRoles("service"), // 角色：服务调用
     )
     if err != nil {
         panic(err)
     }
 
-    // ========== 验签并解析 ==========
-    // 只有持有对应公钥的实例才能验签。即使 HMAC 密钥泄露，
-    // 攻击者也无法伪造 Ed25519 token——因为他不持有私钥。
-    tokenClaims, err := j.ParseToken(token)
+    // ========== 验签方：只持公钥 ==========
+    // 其他服务只需要公钥文件就能验签，拿不到私钥也就无法伪造 token。
+    verifier, err := gojwt.NewJwtEd25519VerifierFromFile(pubPath)
+    if err != nil {
+        panic(err)
+    }
+    tokenClaims, err := verifier.ParseToken(token)
     if err != nil {
         panic(err)
     }
@@ -296,13 +318,29 @@ func main() {
 }
 ```
 
+密钥来自 KMS、Vault 或环境变量时，先解析 PEM 字节再从内存密钥构造：
+
+```go
+privateKey, err := gojwt.ParseEd25519PrivateKeyPEM([]byte(os.Getenv("JWT_ED25519_PRIVATE_PEM")))
+if err != nil {
+    panic(err)
+}
+publicKey, err := gojwt.ParseEd25519PublicKeyPEM([]byte(os.Getenv("JWT_ED25519_PUBLIC_PEM")))
+if err != nil {
+    panic(err)
+}
+j, err := gojwt.NewJwtEd25519FromKeys(privateKey, publicKey)
+```
+
 ### RSA 用法
 
 ```go
 package main
 
 import (
+    "errors"
     "fmt"
+    "io/fs"
     "path/filepath"
 
     jwtv5 "github.com/golang-jwt/jwt/v5"
@@ -312,13 +350,13 @@ import (
 
 func main() {
     // ========== 生成 RSA 密钥对 ==========
-    // RSA 是非对称签名，适合与第三方系统集成（OAuth2 / OIDC 事实标准）。
-    // 2048 bit 适用于 RS256 和 PS256；RS384/PS384 至少 3072 bit；RS512/PS512 至少 4096 bit。
+    // RSA 是非对称签名，适合与使用 RS256 的第三方系统互通。
+    // RS/PS 全系列算法都可用 2048 bit 密钥；需要更高安全强度时用 3072 或 4096。
     priPath := filepath.Join("cert", "jwt_rsa.pem")
     pubPath := filepath.Join("cert", "jwt_rsa.pub.pem")
 
-    // 首次部署时生成 RSA 密钥对。
-    if err := gojwt.GenerateRSAKeys(priPath, pubPath, 2048); err != nil {
+    // 首次部署时生成 RSA 密钥对，文件已存在时不会覆盖。
+    if err := gojwt.GenerateRSAKeys(priPath, pubPath, 2048); err != nil && !errors.Is(err, fs.ErrExist) {
         panic(err)
     }
 
@@ -342,10 +380,13 @@ func main() {
         panic(err)
     }
 
-    // ========== 解析并验签 ==========
-    // 使用公钥验签。如果对接第三方 OIDC 系统（如 Auth0、Cognito），
-    // 你通常只需要加载它们的公钥来验签即可，不需要私钥。
-    tokenClaims, err := j.ParseToken(token)
+    // ========== 验签方：只持公钥 ==========
+    // 持有对方公钥的 PEM 文件即可验签，同样适用于验签第三方系统用 RS/PS 系列签出的 token。
+    verifier, err := gojwt.NewJwtRSAVerifierFromFile(pubPath)
+    if err != nil {
+        panic(err)
+    }
+    tokenClaims, err := verifier.ParseToken(token)
     if err != nil {
         panic(err)
     }
@@ -364,6 +405,7 @@ func main() {
 
 ```go
 j, err := gojwt.NewJwtRSAFromKeys(privateKey, &privateKey.PublicKey)
+verifier, err := gojwt.NewJwtRSAVerifier(&privateKey.PublicKey)
 ```
 
 ## 构造函数
@@ -378,7 +420,7 @@ func NewJwtHmac(secretKey []byte, options ...gojwt.Option) (*gojwt.JwtHmac, erro
 
 - 默认使用 `HS256`
 - 可通过 `WithHMACSigningMethod` 切换到 `HS384` / `HS512`
-- `HS256` 至少 `32` 字节，`HS384` 至少 `48` 字节，`HS512` 至少 `64` 字节
+- `HS256` 至少 `32` 字节，`HS384` 至少 `48` 字节，`HS512` 至少 `64` 字节；用 `GenerateHMACKeyString` 生成的密钥总能满足
 - 密钥只保留在本进程内
 
 示例：
@@ -417,7 +459,7 @@ _ = j
 
 - 不传时默认 `HS256`
 - 当前实例只接受与自身配置一致的 HMAC 算法 token
-- `Ed25519` / `RSA` 实例不接受这个 Option
+- `Ed25519` / `RSA` 实例传入此 Option 时构造返回 `ErrInvalidConfig`
 
 ### `WithRSASigningMethod`
 
@@ -434,58 +476,56 @@ j, err := gojwt.NewJwtRSA(
 
 | 系列 | 算法 | 说明 |
 |------|------|------|
-| PKCS1-v1_5 | `RS256` / `RS384` / `RS512` | 兼容性最好，OAuth2/OIDC 默认 |
+| PKCS1-v1_5 | `RS256` / `RS384` / `RS512` | 兼容性最好，与第三方系统互通的常见选择 |
 | PSS | `PS256` / `PS384` / `PS512` | 更安全，推荐新项目使用 |
 
 注意：
 
 - 不传时默认 `RS256`
-- `HMAC` / `Ed25519` 实例不接受这个 Option
+- `HMAC` / `Ed25519` 实例传入此 Option 时构造返回 `ErrInvalidConfig`
 
-### `NewJwtEd25519`
+### `NewJwtEd25519` 系列
 
 ```go
 func NewJwtEd25519(priPath, pubPath string, options ...gojwt.Option) (*gojwt.JwtEd25519, error)
+func NewJwtEd25519FromKeys(privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey, options ...gojwt.Option) (*gojwt.JwtEd25519, error)
+func NewJwtEd25519Verifier(publicKey ed25519.PublicKey, options ...gojwt.Option) (*gojwt.JwtEd25519, error)
+func NewJwtEd25519VerifierFromFile(pubPath string, options ...gojwt.Option) (*gojwt.JwtEd25519, error)
 ```
 
 说明：
 
-- 从 PEM 文件加载私钥、公钥
-- 私钥负责签名
-- 公钥负责验签
-- 更适合多服务共享公钥的场景
+- `NewJwtEd25519` 从 PEM 文件加载私钥、公钥，`NewJwtEd25519FromKeys` 使用内存中的密钥对
+- 两者都会校验公钥与私钥匹配，不匹配返回 `ErrInvalidKey`
+- `Verifier` 系列只持公钥，解析类方法行为与持私钥实例一致，`GenerateToken` / `RefreshToken` 返回 `ErrNoSigningKey`
+- PEM 字节用 `ParseEd25519PrivateKeyPEM` / `ParseEd25519PublicKeyPEM` 解析，支持 PKCS8 / PKIX 与 64 / 32 字节原始格式
 
-### `NewJwtRSA`
+### `NewJwtRSA` 系列
 
 ```go
 func NewJwtRSA(priPath, pubPath string, options ...gojwt.Option) (*gojwt.JwtRSA, error)
-```
-
-说明：
-
-- 从 PEM 文件加载 RSA 密钥对
-- 支持 PKCS1（`RSA PRIVATE KEY`）和 PKCS8（`PRIVATE KEY`）格式
-- 默认使用 `RS256`
-- 可通过 `WithRSASigningMethod` 切换到 `RS384` / `RS512` / `PS256` / `PS384` / `PS512`
-- 密钥长度要求：`RS256/PS256` 至少 `2048` bit，`RS384/PS384` 至少 `3072` bit，`RS512/PS512` 至少 `4096` bit
-
-示例：
-
-```go
-j, err := gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithRSASigningMethod(jwtv5.SigningMethodPS256))
-```
-
-### `NewJwtRSAFromKeys`
-
-```go
 func NewJwtRSAFromKeys(privateKey *rsa.PrivateKey, publicKey *rsa.PublicKey, options ...gojwt.Option) (*gojwt.JwtRSA, error)
+func NewJwtRSAVerifier(publicKey *rsa.PublicKey, options ...gojwt.Option) (*gojwt.JwtRSA, error)
+func NewJwtRSAVerifierFromFile(pubPath string, options ...gojwt.Option) (*gojwt.JwtRSA, error)
 ```
 
 说明：
 
-- 直接使用内存中的 RSA 密钥对创建实例
-- 适用于密钥来自 KMS、Vault、环境变量等外部系统
-- 其余行为与 `NewJwtRSA` 一致
+- `NewJwtRSA` 从 PEM 文件加载 RSA 密钥对，支持 PKCS1（`RSA PRIVATE KEY`）和 PKCS8（`PRIVATE KEY`）私钥格式
+- `NewJwtRSAFromKeys` 使用内存中的密钥对，输入会被复制并预计算
+- 两者都会校验公钥与私钥匹配，不匹配返回 `ErrInvalidKey`
+- `Verifier` 系列只持公钥，解析类方法行为与持私钥实例一致，`GenerateToken` / `RefreshToken` 返回 `ErrNoSigningKey`
+- 默认使用 `RS256`，可通过 `WithRSASigningMethod` 切换到 `RS384` / `RS512` / `PS256` / `PS384` / `PS512`
+- 密钥长度要求：全系列至少 `2048` bit（RFC 7518）
+- PEM 字节用 `ParseRSAPrivateKeyPEM` / `ParseRSAPublicKeyPEM` 解析
+
+### 密钥加载错误
+
+四个 `ParseXxxPEM` 函数与文件构造函数的错误语义一致：
+
+- PEM 解码失败、密钥长度错误、结构解析失败：`errors.Is(err, gojwt.ErrInvalidKey)`
+- 密钥算法类型不符（例如把 Ed25519 的 PKCS8 交给 `ParseRSAPrivateKeyPEM`）：`errors.Is(err, gojwt.ErrInvalidKeyType)`
+- 文件读取失败：保留 `fs` 错误链，`errors.Is(err, fs.ErrNotExist)` 可判断文件不存在
 
 ## 构造 Option
 
@@ -507,10 +547,10 @@ _ = j
 
 ### `WithRefreshDuration`
 
-用于设置刷新总窗口。
+用于设置会话最长时长，从首次签发时刻 `auth_time` 起算。
 
 ```go
-// 将 refresh 总窗口设置为 3 天。
+// 会话最长 3 天：刷新最多把会话延续到首次签发后 3 天。
 j, err := gojwt.NewJwtHmac(
     []byte("12345678901234567890123456789012"),
     gojwt.WithRefreshDuration(72*time.Hour),
@@ -520,6 +560,35 @@ if err != nil {
 }
 _ = j
 ```
+
+说明：
+
+- 默认 `7 天`
+- 取值必须不短于 `WithTokenDuration`，否则构造返回 `ErrInvalidConfig`
+- 到达终点后 `RefreshToken` 返回 `ErrRefreshExpired`
+
+### `WithRefreshWindow`
+
+用于设置刷新窗口：token 距过期不足此时长时才允许刷新。
+
+```go
+// 距过期 10 分钟内可刷新。
+j, err := gojwt.NewJwtHmac(
+    []byte("12345678901234567890123456789012"),
+    gojwt.WithTokenDuration(time.Hour),
+    gojwt.WithRefreshWindow(10*time.Minute),
+)
+if err != nil {
+    panic(err)
+}
+_ = j
+```
+
+说明：
+
+- 默认 `5 分钟`；token 有效期短于 5 分钟时默认窗口等于整段有效期
+- 取值必须大于零且不超过 `WithTokenDuration`，否则构造返回 `ErrInvalidConfig`
+- 设为与有效期相等即整段有效期内随时可刷新
 
 ### `WithParseLeeway`
 
@@ -540,8 +609,32 @@ _ = j
 说明：
 
 - 默认值为 `5 秒`
-- 会同时作用于 `exp`、`nbf`、`iat`
+- 会同时作用于 `exp`、`nbf`、`iat`；解析默认要求 `exp` 存在并校验 `iat` 不晚于当前时刻加 leeway
 - 如果你希望严格按时间字段校验，可显式传 `gojwt.WithParseLeeway(0)`
+
+### `WithParserOptions`
+
+用于设置实例级的 `jwtv5.ParserOption`，每次解析都会应用。
+
+```go
+j, err := gojwt.NewJwtHmac(
+    []byte("12345678901234567890123456789012"),
+    gojwt.WithParserOptions(
+        jwtv5.WithIssuer("auth-center"),
+        jwtv5.WithAudience("web"),
+    ),
+)
+if err != nil {
+    panic(err)
+}
+_ = j
+```
+
+说明：
+
+- 应用顺序为包内默认选项 → 实例级选项 → 单次调用传入的选项
+- 实例级选项固定不变，`CachedParseToken` 的缓存对它仍然生效；单次调用传入的选项仍会绕过缓存
+- 适合把 issuer / audience 校验固定在实例上，避免每个调用点各写一遍
 
 ### `WithKeyID`
 
@@ -566,9 +659,17 @@ _ = j
 - `HMAC`、`Ed25519`、`RSA` 三种实现都支持，`RefreshToken` 产出的新 token 同样带上 `kid`
 - `kid` 只是密钥标识，会以明文出现在 token 里，不要放密钥本身或任何敏感信息
 
-验证侧用 `ParseKeyID` 读出 `kid` 来定位密钥，见下一节。
+验证侧用 `KeyRing` 按 `kid` 汇集多个实例，见下一节。
 
-两个典型用途：
+### `KeyRing`
+
+按 `kid` 汇集多个验签方：解析时用 `ParseKeyID` 取出 token 的 `kid`，再委托给对应实例验签。
+
+```go
+func NewKeyRing() *KeyRing
+func (r *KeyRing) Register(kid string, v Verifier) error
+func (r *KeyRing) Unregister(kid string)
+```
 
 **密钥轮换**。新旧密钥并存期间，验证方靠 `kid` 知道该用哪一把，不必停机切换：
 
@@ -577,49 +678,41 @@ _ = j
 oldJwt, _ := gojwt.NewJwtHmac(oldSecret, gojwt.WithKeyID("app-2025"))
 newJwt, _ := gojwt.NewJwtHmac(newSecret, gojwt.WithKeyID("app-2026"))
 
-verifiers := map[string]*gojwt.JwtHmac{
-    "app-2025": oldJwt,
-    "app-2026": newJwt,
-}
+ring := gojwt.NewKeyRing()
+_ = ring.Register("app-2025", oldJwt)
+_ = ring.Register("app-2026", newJwt)
 
-// 验证方：先按 kid 选密钥，再用选中的实例验签
-kid, err := gojwt.ParseKeyID(tokenString)
-if err != nil {
-    return err
-}
-j, ok := verifiers[kid]
-if !ok {
-    return gojwt.ErrInvalidKey
-}
-cc, err := j.ParseToken(tokenString)
+// 验证方：一次调用完成选键与验签
+cc, err := ring.ParseToken(tokenString)
+
+// 老 token 全部过期后注销旧 kid，之后携带旧 kid 的 token 返回 ErrUnknownKeyID
+ring.Unregister("app-2025")
 ```
 
-**网关侧预校验**。网关按 `kid` 在多个密钥中定位，同一个网关可以同时接收不同算法签发的 token：
+**网关侧多算法分流**。同一个网关同时接收不同算法签发的 token，靠 `kid` 分流到对应实例：
 
 ```go
 hmacJwt, _ := gojwt.NewJwtHmac(secret, gojwt.WithKeyID("app-2026"))
-rsaJwt, _  := gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithKeyID("rs-2026"))
+rsaVerifier, _ := gojwt.NewJwtRSAVerifierFromFile(pubPath) // 网关只持公钥
 
-// 两种算法签发的 token 走同一个入口，靠 kid 分流到对应实例
-verifiers := map[string]gojwt.Tokener{
-    "app-2026": hmacJwt,
-    "rs-2026":  rsaJwt,
-}
+ring := gojwt.NewKeyRing()
+_ = ring.Register("app-2026", hmacJwt)
+_ = ring.Register("rs-2026", rsaVerifier)
+_ = ring.Register("", legacyJwt) // 空 kid：升级前签发、未携带 kid 的 token
 
-kid, err := gojwt.ParseKeyID(tokenString)
-if err != nil {
-    return err
-}
-j, ok := verifiers[kid]
-if !ok {
-    return gojwt.ErrInvalidKey
-}
-cc, err := j.ParseToken(tokenString)
+cc, err := ring.ParseToken(tokenString)
 ```
+
+说明：
+
+- `KeyRing` 实现 `Verifier`，`ParseToken` / `CachedParseToken` / `ParallelVerify` 及对应 context 变体都按 kid 逐个选键
+- 空 kid 注册的实例用于未携带 `kid` 的 token
+- `kid` 未注册返回 `ErrUnknownKeyID`；token 格式错误返回 `ErrTokenMalformed`
+- 并发安全，`Register` / `Unregister` 可在运行期调用
 
 ### `ParseKeyID`
 
-不验签地读出 token header 中的 `kid`，用于在验签前定位该用哪一把密钥。
+不验签地读出 token header 中的 `kid`，用于在验签前定位该用哪一把密钥。`KeyRing` 内部就是用它选键。
 
 ```go
 kid, err := gojwt.ParseKeyID(tokenString)
@@ -634,49 +727,53 @@ kid, err := gojwt.ParseKeyID(tokenString)
 - 返回的 `kid` 来自未经验证的数据，攻击者可控。它只能用来挑选密钥，
   随后必须用选中的密钥走一次 `ParseToken` 完成验签，不能直接用于鉴权或授权判断
 
-### `WithBlacklistCheckFunc`
+### `WithBlacklistFunc` / `WithBlacklistCheckFunc` / `WithBlacklistCheckContextFunc`
 
-用于注入可返回错误的黑名单检查函数，适合 Redis、数据库等外部依赖场景。
-
-```go
-ctx := context.Background()
-
-j, err := gojwt.NewJwtHmac(
-    []byte("12345678901234567890123456789012"),
-    gojwt.WithBlacklistCheckFunc(func(tokenID string) (bool, error) {
-        n, err := rdb.Exists(ctx, "jwt:blacklist:"+tokenID).Result()
-        return n > 0, err
-    }),
-)
-if err != nil {
-    panic(err)
-}
-_ = j
-```
-
-### `WithBlacklistCheckContextFunc`
-
-用于注入支持 `context.Context` 的黑名单检查函数，适合 Redis、数据库等需要超时控制的外部依赖场景。
+用于注入按 `token_id` 查询的黑名单检查函数。三者只能配置一个，同时配置多个时构造返回 `ErrInvalidConfig`。
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-defer cancel()
-token := "your.jwt.token.here"
+// 内存黑名单
+j, err := gojwt.NewJwtHmac(secret, gojwt.WithBlacklistFunc(blacklist.In))
 
+// Redis：支持 context 超时，存储不可用时返回 error 让鉴权 fail closed
 j, err := gojwt.NewJwtHmac(
-    []byte("12345678901234567890123456789012"),
+    secret,
     gojwt.WithBlacklistCheckContextFunc(func(ctx context.Context, tokenID string) (bool, error) {
         n, err := rdb.Exists(ctx, "jwt:blacklist:"+tokenID).Result()
         return n > 0, err
     }),
 )
-if err != nil {
-    panic(err)
-}
-
-_, err = j.ParseTokenContext(ctx, token)
-_ = err
 ```
+
+说明：
+
+- 命中黑名单时解析返回 `ErrTokenBlacklisted`
+- 检查函数返回 error 时解析返回包装后的该 error
+- `ParseTokenContext` / `CachedParseTokenContext` / `ParallelVerifyContext` 会把 ctx 透传给 context 版检查函数
+
+### `WithRevocationCheck`
+
+用于注入接收完整 claims 的吊销回调，覆盖"按用户吊销"这类黑名单做不到的场景。
+
+```go
+j, err := gojwt.NewJwtHmac(
+    secret,
+    // 改密后让该用户在改密时刻之前签发的全部 token 作废
+    gojwt.WithRevocationCheck(func(ctx context.Context, c *claims.Claims) (bool, error) {
+        cutoff, err := store.PasswordChangedAt(ctx, c.UserID)
+        if err != nil {
+            return false, err // 存储不可用时 fail closed
+        }
+        return c.IssuedAt != nil && c.IssuedAt.Time.Before(cutoff), nil
+    }),
+)
+```
+
+说明：
+
+- 在签名与 claims 校验通过、黑名单检查之后执行；`CachedParseToken` 缓存命中时同样执行
+- 返回 `true` 时解析返回 `ErrTokenBlacklisted`；返回 error 时解析返回包装后的该 error
+- 可与黑名单 Option 同时配置：黑名单负责单个 token 的登出，回调负责用户级吊销
 
 ## HMAC 算法选择
 
@@ -692,7 +789,7 @@ _ = err
 
 - 常规业务默认用 `HS256` 即可
 - 只有当你明确要求更长摘要或与外部系统算法对齐时，再选 `HS384` / `HS512`
-- 不要只改算法不升级密钥长度；算法越强，密钥也应该同步变长
+- 密钥用 `GenerateHMACKeyString(method)` 生成，它按算法给出足够长的密钥
 
 > `Options` 是历史兼容别名，已 deprecated，新代码请使用 `Option`。
 
@@ -709,10 +806,12 @@ _ = err
 - `claims.WithExpiresIn(d time.Duration)` — 设置相对过期时长
 - `claims.WithExpiresAtTime(t time.Time)` — 设置绝对过期时间
 - `claims.WithJwtID(jwtID string)`
+- `claims.WithExt(key string, value any)` — 写入业务扩展字段
 
 说明：
 
 - `claims.WithJwtID` 会同时设置标准字段 `jti` 和业务字段 `token_id`
+- `claims.WithExt` 的值必须能被 `encoding/json` 编码，否则签发时返回错误；刷新会保留全部扩展字段
 - `claims.WithExpiresAt` 仍可用，但已 deprecated，请迁移到 `WithExpiresIn`
 
 示例：
@@ -726,6 +825,8 @@ token, err := j.GenerateToken(
     claims.WithIssuer("gtkit-auth"),
     claims.WithSubject("access-token"),
     claims.WithAudience("web", "mobile"),
+    claims.WithExt("tenant_id", 42),
+    claims.WithExt("device_id", "ios-7f3a"),
 )
 if err != nil {
     panic(err)
@@ -746,8 +847,9 @@ func (j *JwtRSA) GenerateToken(uid int64, options ...claims.Option) (string, err
 行为说明：
 
 - 根据 `uid` 与附加 `claims.Option` 生成 JWT
-- 自动写入 `exp`、`iat`、`nbf`
+- 自动写入 `exp`、`iat`、`nbf`、`auth_time`
 - 自动生成唯一 `TokenID`
+- 只持公钥的验签实例返回 `ErrNoSigningKey`
 
 ### `ParseToken`
 
@@ -762,11 +864,12 @@ func (j *JwtRSA) ParseTokenContext(ctx context.Context, tokenString string, opt 
 
 行为说明：
 
-- 完成验签
-- 校验标准时间字段
+- 完成验签，只接受与实例算法一致的 token
+- 校验标准时间字段：要求 `exp` 存在，校验 `exp`、`nbf`、`iat`
 - 默认带 `5 秒` leeway，用于吸收轻微时钟漂移
-- 可通过构造时的 `WithParseLeeway` 修改，或在单次调用中通过 `jwt.ParserOption` 覆盖
-- 返回 `*claims.Claims`
+- 可通过构造时的 `WithParseLeeway` / `WithParserOptions` 修改，或在单次调用中通过 `jwt.ParserOption` 覆盖
+- 执行黑名单检查与吊销回调（如果配置了的话）
+- 返回 `*claims.Claims`；错误满足对应的 sentinel，`err.Error()` 中带底层库的原因文本
 
 示例：
 
@@ -794,13 +897,13 @@ func (j *JwtRSA) CachedParseTokenContext(ctx context.Context, tokenString string
 行为说明：
 
 - 首次解析时正常验签并缓存 Claims
-- 再次解析相同 token 时优先命中缓存
-- 返回的是 Claims 副本，避免调用方意外改坏缓存对象
-- 仅在未传入 `ParserOption` 时使用缓存；传入 `issuer`/`audience`/`subject` 等校验选项时会退化为普通解析
+- 再次解析相同 token 时优先命中缓存，命中后仍执行黑名单检查与吊销回调
+- 返回的是 Claims 副本（含 `Ext` 的嵌套结构），避免调用方意外改坏缓存对象
+- 仅在未传入单次调用 `ParserOption` 时使用缓存；构造期的 `WithParserOptions` 不影响缓存
 
 注意事项：
 
-- 缓存是“实例级”的，不跨不同 JWT 实例共享
+- 缓存是"实例级"的，不跨不同 JWT 实例共享
 - 缓存采用 LRU 淘汰，容量上限严格受 `WithCacheMaxEntries` 控制
 - 过期条目会做惰性清扫
 - 默认最多缓存 `4096` 个 token，可通过 `WithCacheMaxEntries` 调整
@@ -831,10 +934,12 @@ func (j *JwtRSA) RefreshTokenContext(ctx context.Context, tokenString string, op
 
 行为说明：
 
-- 使用旧 token 中的 Claims 重新签发新 token
-- 保留原业务字段
-- 生成新的 `TokenID/jti`，重置 `iat`、`nbf`、`exp`
+- 使用旧 token 中的 Claims 重新签发新 token，保留原业务字段与 `auth_time`
+- 生成新的 `TokenID/jti`，重置 `iat`、`nbf`
+- 新 token 保留旧 token 的有效时长，`exp` 不越过 `auth_time + refreshDuration`
+- 距过期仍超过刷新窗口返回 `ErrRefreshTooEarly`；会话已到终点返回 `ErrRefreshExpired`
 - 旧 token 与新 token 可独立吊销
+- 只持公钥的验签实例返回 `ErrNoSigningKey`
 
 示例：
 
@@ -842,8 +947,12 @@ func (j *JwtRSA) RefreshTokenContext(ctx context.Context, tokenString string, op
 // 对即将过期的 token 进行刷新。
 newToken, err := j.RefreshToken(oldToken)
 if err != nil {
-    if errors.Is(err, gojwt.ErrRefreshTooEarly) {
-        // 这里表示 token 还没进入刷新窗口。
+    switch {
+    case errors.Is(err, gojwt.ErrRefreshTooEarly):
+        // token 还没进入刷新窗口。
+        return
+    case errors.Is(err, gojwt.ErrRefreshExpired):
+        // 会话已到最长时长，让用户重新登录。
         return
     }
     panic(err)
@@ -868,8 +977,8 @@ func (j *JwtRSA) ParallelVerifyContext(ctx context.Context, tokens []string, opt
 - 并发验证多个 token
 - 内部使用有界 worker pool，而不是为每个 token 单独起 goroutine
 - 默认最大并发数为 `min(len(tokens), runtime.GOMAXPROCS(0))`
-- `results[i]` 与 `errs[i]` 对应同一个输入 token
-- `ParallelVerifyContext` 会在 `ctx` 取消后停止分发未开始的任务，并将 ctx 透传给 context-aware 黑名单检查函数
+- `results[i]` 与 `errs[i]` 对应同一个输入 token，两个切片总与输入等长
+- `ParallelVerifyContext` 会在 `ctx` 取消后停止分发未开始的任务，并将 ctx 透传给 context-aware 黑名单检查函数与吊销回调
 
 注意事项：
 
@@ -889,6 +998,18 @@ for i := range result {
     fmt.Println("uid:", result[i].UserID)
 }
 ```
+
+### `ParseBearerToken`
+
+```go
+func ParseBearerToken(authorization string) (string, error)
+```
+
+行为说明：
+
+- 从 `Authorization` 头的值中取出 Bearer token，scheme 大小写不敏感
+- 头为空返回 `ErrAuthorizationMissing`，对应 401 并回 `WWW-Authenticate: Bearer`
+- scheme 不是 `Bearer`、token 为空或含空白返回 `ErrAuthorizationInvalid`，对应 400
 
 ## Claims 辅助方法
 
@@ -910,6 +1031,16 @@ if err := tokenClaims.VerifyPrv("admin"); err != nil {
 }
 ```
 
+### `ExtString` / `ExtInt64`
+
+```go
+// 读取扩展字段。JSON 往返会把整数变成 float64，ExtInt64 会把它转回 int64。
+tenantID, ok := tokenClaims.ExtInt64("tenant_id")
+deviceID, ok := tokenClaims.ExtString("device_id")
+```
+
+键不存在、类型不符、数值带小数或超出 `int64` 范围时第二个返回值为 `false`。
+
 ### `TTL`
 
 ```go
@@ -918,9 +1049,13 @@ ttl := tokenClaims.TTL()
 fmt.Println("ttl:", ttl)
 ```
 
-## 统一接口 `Tokener`
+## 统一接口
 
-如果你的业务层不想依赖具体算法实现，可以面向 `Tokener` 编程。
+三个接口按职责拆分，业务层按需要的能力选择：
+
+- `Tokener`：签发、解析、刷新、缓存解析、并发验签，三种签名实现都满足
+- `Verifier`：只有解析类方法（含 context 变体），三种签名实现与 `KeyRing` 都满足，验签方与网关面向它编程
+- `Issuer`：签发与刷新（含 context 变体），三种签名实现都满足
 
 ```go
 package main
@@ -930,13 +1065,18 @@ import (
     "github.com/gtkit/gojwt/claims"
 )
 
-func IssueToken(t gojwt.Tokener, uid int64) (string, error) {
+func IssueToken(t gojwt.Issuer, uid int64) (string, error) {
     // 调用方不用关心底层是 HMAC、Ed25519 还是 RSA。
     return t.GenerateToken(uid, claims.WithPrv("admin"))
 }
+
+func Authenticate(v gojwt.Verifier, token string) (*claims.Claims, error) {
+    // 传入单个实例或 KeyRing 都可以。
+    return v.CachedParseToken(token)
+}
 ```
 
-需要 context 取消能力时，可按需断言扩展接口：
+面向 `Tokener` 编程时，需要 context 取消能力可按需断言扩展接口：
 
 ```go
 if ct, ok := t.(gojwt.ContextTokener); ok {
@@ -1019,19 +1159,18 @@ blacklist.Remove("token-id-1")
 
 注意：
 
-- 当前是纯内存实现
+- 当前是纯内存实现，适用于单实例部署
 - `AddToken` / `AddWithExpiration` 写入的条目会在到达过期时间后惰性失效
 - 如果使用 `NewBlacklistWithCleanup`，后台会按固定间隔主动清理过期条目
 - `Close()` 应在服务退出时调用，用于停止后台清理协程
 - `Add(tokenID)` 是兼容旧代码的永久拉黑接口
-- 进程重启后数据会丢失
-- 多实例之间不会自动同步
 
-如果你要在多实例部署下使用黑名单，建议将 `token_id` 存入 Redis。
+多副本部署时把 `token_id` 存入 Redis，通过 `WithBlacklistCheckContextFunc` 接入即可。
 
 ## 中间件接入示例
 
-下面给一个简化版 HTTP 中间件示例，演示如何解析 Bearer Token、校验黑名单，并把 Claims 放进请求上下文。
+下面给一个简化版 HTTP 中间件示例，演示如何解析 Bearer Token、验签并把 Claims 放进请求上下文。
+黑名单与吊销回调在构造实例时通过 Option 注入，中间件里不需要再单独检查。
 
 ```go
 package main
@@ -1040,7 +1179,6 @@ import (
     "context"
     "errors"
     "net/http"
-    "strings"
 
     "github.com/gtkit/gojwt"
     "github.com/gtkit/gojwt/claims"
@@ -1049,59 +1187,46 @@ import (
 // claimsKey 是 context 中存储 Claims 的键，使用空结构体避免 key 冲突。
 type claimsKey struct{}
 
-// AuthMiddleware 返回一个 HTTP 中间件，负责从请求中解析 Bearer Token、
-// 校验黑名单，并把解析后的 Claims 注入请求上下文。
+// AuthMiddleware 返回一个 HTTP 中间件，负责从请求中解析 Bearer Token、验签，
+// 并把解析后的 Claims 注入请求上下文。
 //
-// 参数说明：
-//   - j：JWT 实例。理论上可以是 *JwtHmac / *JwtEd25519 / *JwtRSA 的任意一种，
-//     因为它们都实现了 Tokener 接口（本例为简洁用具体类型演示）。
-//   - blacklist：黑名单检查器。传 nil 则跳过黑名单检查。
+// v 可以是 *JwtHmac / *JwtEd25519 / *JwtRSA 的任意一种，也可以是 KeyRing，
+// 它们都实现了 Verifier 接口。
 //
 // 在 handler 中通过 ClaimsFromContext 获取 Claims。
-func AuthMiddleware(j *gojwt.JwtHmac, blacklist gojwt.Blacklister) func(http.Handler) http.Handler {
+func AuthMiddleware(v gojwt.Verifier) func(http.Handler) http.Handler {
     return func(next http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
             // ========== 第一步：取 Token ==========
-            // 标准 HTTP Authorization 头格式："Bearer <token>"
-            authHeader := r.Header.Get("Authorization")
-            if authHeader == "" {
-                http.Error(w, "missing authorization header", http.StatusUnauthorized)
+            token, err := gojwt.ParseBearerToken(r.Header.Get("Authorization"))
+            if err != nil {
+                if errors.Is(err, gojwt.ErrAuthorizationMissing) {
+                    w.Header().Set("WWW-Authenticate", `Bearer realm="api"`)
+                    http.Error(w, "missing authorization header", http.StatusUnauthorized)
+                    return
+                }
+                http.Error(w, "invalid authorization header", http.StatusBadRequest)
                 return
             }
-
-            // 只接受 Bearer 方案，不做 Basic / Digest 等。
-            const prefix = "Bearer "
-            if !strings.HasPrefix(authHeader, prefix) {
-                http.Error(w, "invalid authorization scheme", http.StatusUnauthorized)
-                return
-            }
-
-            token := strings.TrimPrefix(authHeader, prefix)
 
             // ========== 第二步：解析并验签 ==========
-            // 使用 CachedParseToken：同一请求链路中如果多次读取 Claims，
-            // 第二次开始命中缓存，避免重复 RSA/Ed25519 验签开销。
-            tokenClaims, err := j.CachedParseToken(token)
+            // 使用 CachedParseTokenContext：同一 token 重复到达时命中缓存，避免重复 RSA/Ed25519 验签开销；
+            // 缓存命中后仍会执行黑名单检查与吊销回调。
+            tokenClaims, err := v.CachedParseTokenContext(r.Context(), token)
             if err != nil {
                 // 根据错误类型返回不同的 HTTP 状态和消息。
                 switch {
                 case errors.Is(err, gojwt.ErrTokenExpired):
                     http.Error(w, "token expired", http.StatusUnauthorized)
+                case errors.Is(err, gojwt.ErrTokenBlacklisted):
+                    http.Error(w, "token revoked", http.StatusUnauthorized)
                 default:
                     http.Error(w, "invalid token", http.StatusUnauthorized)
                 }
                 return
             }
 
-            // ========== 第三步：黑名单检查 ==========
-            // 即使 token 签名有效且未过期，如果 TokenID 已被加入黑名单
-            //（用户登出、管理员强制吊销等），仍应拒绝。
-            if blacklist != nil && blacklist.In(tokenClaims.TokenID) {
-                http.Error(w, "token revoked", http.StatusUnauthorized)
-                return
-            }
-
-            // ========== 第四步：放行 ==========
+            // ========== 第三步：放行 ==========
             // 将 Claims 放入 context，后续 handler 可以直接读取用户 ID / 角色 / 业务域。
             ctx := context.WithValue(r.Context(), claimsKey{}, tokenClaims)
             next.ServeHTTP(w, r.WithContext(ctx))
@@ -1120,13 +1245,38 @@ func ClaimsFromContext(ctx context.Context) (*claims.Claims, bool) {
 }
 ```
 
+Gin 项目的接线方式相同：
+
+```go
+func GinAuth(v gojwt.Verifier) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        token, err := gojwt.ParseBearerToken(c.GetHeader("Authorization"))
+        if err != nil {
+            status := http.StatusBadRequest
+            if errors.Is(err, gojwt.ErrAuthorizationMissing) {
+                status = http.StatusUnauthorized
+            }
+            c.AbortWithStatusJSON(status, gin.H{"error": err.Error()})
+            return
+        }
+        tokenClaims, err := v.CachedParseTokenContext(c.Request.Context(), token)
+        if err != nil {
+            c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+            return
+        }
+        c.Set("claims", tokenClaims)
+        c.Next()
+    }
+}
+```
+
 ## 登录 / 刷新 / 登出 示例
 
 ### 登录接口示例
 
 ```go
 // 登录成功后签发 access token。
-func Login(j *gojwt.JwtHmac, uid int64) (string, error) {
+func Login(j gojwt.Issuer, uid int64) (string, error) {
     return j.GenerateToken(
         uid,
         // 标记为后台管理端 token。
@@ -1140,13 +1290,15 @@ func Login(j *gojwt.JwtHmac, uid int64) (string, error) {
 ### 刷新接口示例
 
 ```go
-// 刷新接口建议显式区分“未到刷新窗口”和“token 真失效”。
-func Refresh(j *gojwt.JwtHmac, oldToken string) (string, error) {
+// 刷新接口显式区分"未到刷新窗口""会话到期"和"token 失效"。
+func Refresh(j gojwt.Issuer, oldToken string) (string, error) {
     newToken, err := j.RefreshToken(oldToken)
     if err != nil {
-        if errors.Is(err, gojwt.ErrRefreshTooEarly) {
-            // 这里可以返回 400 或业务码，提示客户端稍后再刷新。
-            return "", err
+        switch {
+        case errors.Is(err, gojwt.ErrRefreshTooEarly):
+            // 返回 400 或业务码，提示客户端稍后再刷新。
+        case errors.Is(err, gojwt.ErrRefreshExpired):
+            // 会话已到最长时长，返回 401 让客户端重新登录。
         }
         return "", err
     }
@@ -1166,36 +1318,39 @@ func Logout(blacklist *gojwt.Blacklist, tokenClaims *claims.Claims) error {
 }
 ```
 
+### 改密踢下线示例
+
+```go
+// 改密时记录时刻；WithRevocationCheck 回调据此把该用户改密前签发的全部 token 判为已吊销。
+func ChangePassword(ctx context.Context, store Store, uid int64, newPassword string) error {
+    if err := store.UpdatePassword(ctx, uid, newPassword); err != nil {
+        return err
+    }
+    return store.SetPasswordChangedAt(ctx, uid, time.Now())
+}
+```
+
 ## 密钥工具
 
 ### 生成 HMAC 密钥
 
 ```go
-// 生成随机 HMAC 密钥字符串。
-secret, err := gojwt.GenerateSecureKeyString()
+// 按算法生成随机 HMAC 密钥字符串，直接 []byte(secret) 作为 NewJwtHmac 的密钥即可。
+secret, err := gojwt.GenerateHMACKeyString(jwtv5.SigningMethodHS512)
 if err != nil {
     panic(err)
 }
-fmt.Println(secret)
+fmt.Println(secret) // 86 字符
 ```
 
-### 兼容旧方法
-
-```go
-// Deprecated: 新代码请使用 GenerateSecureKeyString。
-secret, err := gojwt.GenerateSecureKey()
-if err != nil {
-    panic(err)
-}
-fmt.Println(secret)
-```
+生成长度：HS256 为 32 字节随机数（43 字符），HS384 为 48 字节（64 字符），HS512 为 64 字节（86 字符）。
 
 ### 生成 Ed25519 密钥对
 
 ```go
-// 生成 PEM 格式的 Ed25519 密钥对文件。
+// 生成 PEM 格式的 Ed25519 密钥对文件；目标文件已存在时返回 fs.ErrExist，不会覆盖。
 err := gojwt.GenerateEd25519Keys("./cert/jwt.pem", "./cert/jwt.pub.pem")
-if err != nil {
+if err != nil && !errors.Is(err, fs.ErrExist) {
     panic(err)
 }
 ```
@@ -1203,41 +1358,57 @@ if err != nil {
 ### 生成 RSA 密钥对
 
 ```go
-// 生成 2048 bit RSA 密钥对（适用于 RS256/PS256）。
+// 生成 2048 bit RSA 密钥对，RS/PS 全系列算法都可用；目标文件已存在时返回 fs.ErrExist，不会覆盖。
 err := gojwt.GenerateRSAKeys("./cert/rsa.pem", "./cert/rsa.pub.pem", 2048)
-if err != nil {
+if err != nil && !errors.Is(err, fs.ErrExist) {
     panic(err)
 }
 
-// 生成 4096 bit RSA 密钥对（适用于 RS512/PS512）。
+// 需要更高安全强度时生成 3072 或 4096 bit。
 err = gojwt.GenerateRSAKeys("./cert/rsa4096.pem", "./cert/rsa4096.pub.pem", 4096)
-if err != nil {
-    panic(err)
-}
 ```
+
+### 解析 PEM 字节
+
+```go
+func ParseRSAPrivateKeyPEM(data []byte) (*rsa.PrivateKey, error)
+func ParseRSAPublicKeyPEM(data []byte) (*rsa.PublicKey, error)
+func ParseEd25519PrivateKeyPEM(data []byte) (ed25519.PrivateKey, error)
+func ParseEd25519PublicKeyPEM(data []byte) (ed25519.PublicKey, error)
+```
+
+密钥来自 KMS、Vault、环境变量或配置中心时，用它们解析后交给 `NewJwtRSAFromKeys` / `NewJwtRSAVerifier` /
+`NewJwtEd25519FromKeys` / `NewJwtEd25519Verifier`。
 
 ## 错误处理
 
 常见错误包括：
 
-- `ErrJWTNotInit`
+- `ErrInvalidConfig`：构造参数非法，错误信息指出该改哪个 Option
+- `ErrJWTNotInit`：在 nil 实例上调用方法
+- `ErrInvalidKey` / `ErrInvalidKeyType`：密钥加载失败、公私钥不匹配、密钥算法类型不符
+- `ErrNoSigningKey`：只持公钥的实例调用签发或刷新
+- `ErrUnknownKeyID`：`KeyRing` 中没有注册 token 携带的 `kid`
 - `ErrTokenMalformed`
 - `ErrTokenUnverifiable`
 - `ErrTokenSignatureInvalid`
-- `ErrTokenRequiredClaimMissing`
+- `ErrTokenRequiredClaimMissing`：缺少 `exp` 等必需字段
 - `ErrTokenInvalidAudience`
 - `ErrTokenExpired`
-- `ErrTokenUsedBeforeIssued`
+- `ErrTokenUsedBeforeIssued`：`iat` 晚于当前时刻加 leeway
 - `ErrTokenInvalidIssuer`
 - `ErrTokenInvalidSubject`
 - `ErrTokenNotValidYet`
 - `ErrTokenInvalidClaims`
 - `ErrTokenInvalid`
+- `ErrTokenBlacklisted`：黑名单命中或吊销回调判定已吊销
 - `ErrRefreshTooEarly`
+- `ErrRefreshExpired`：会话已到 `auth_time + refreshDuration`
+- `ErrAuthorizationMissing` / `ErrAuthorizationInvalid`
 - `ErrTokenRole`
 - `ErrTokenPrv`
 
-推荐使用 `errors.Is` 判断：
+推荐使用 `errors.Is` 判断；解析类错误的 `err.Error()` 同时带有底层库的原因文本，便于排障：
 
 ```go
 if err != nil {
@@ -1248,6 +1419,8 @@ if err != nil {
         fmt.Println("token 签名非法")
     case errors.Is(err, gojwt.ErrRefreshTooEarly):
         fmt.Println("未到刷新窗口")
+    case errors.Is(err, gojwt.ErrRefreshExpired):
+        fmt.Println("会话已到期")
     default:
         fmt.Println("处理失败:", err)
     }
@@ -1281,7 +1454,7 @@ if err != nil {
 
 优点：
 
-- 公私钥职责分离
+- 公私钥职责分离，验签方只需 `NewJwtEd25519VerifierFromFile`
 - 签名验签速度最快的非对称算法
 - 密钥短（32 字节）
 
@@ -1289,19 +1462,18 @@ if err != nil {
 
 适合：
 
-- 需要对接第三方 OAuth2 / OIDC 系统（RS256 是事实标准）
-- 与 AWS Cognito、Auth0、Firebase 等云服务集成
+- 需要与使用 RS256 的第三方系统互通，持有对方公钥即可验签
 - 需要 NIST 合规的场景
 
 优点：
 
-- 生态兼容性最好，几乎所有 IdP 都支持
+- 生态兼容性最好
 - PSS 系列比 PKCS1-v1_5 更安全
-- 公私钥职责分离
+- 公私钥职责分离，验签方只需 `NewJwtRSAVerifierFromFile`
 
 注意：
 
-- 密钥较长（2048-4096 bit），签名验签比 Ed25519 慢
+- 密钥较长（2048 bit 起），签名验签比 Ed25519 慢
 - 新项目如无兼容性要求，优先考虑 Ed25519
 
 ### 快速选型
@@ -1310,7 +1482,7 @@ if err != nil {
 |------|------|
 | 单体服务、简单鉴权 | HMAC（HS256） |
 | 微服务、签发/验证分离、高性能 | Ed25519 |
-| 对接第三方 OAuth2/OIDC | RSA（RS256） |
+| 与使用 RS256 的第三方系统互通 | RSA（RS256） |
 | 新项目、更安全的 RSA | RSA（PS256） |
 
 ## 最佳实践
@@ -1325,42 +1497,47 @@ if err != nil {
 - 逻辑更清晰
 - 不暴露完整 token 内容
 
-### 2. HMAC 密钥使用随机高熵字符串
+### 2. HMAC 密钥用 `GenerateHMACKeyString` 生成
 
-虽然库里已经强制要求最少 `32` 字节，但仍建议使用 `GenerateSecureKeyString()` 生成，不要手写简单口令。
+库里按算法强制要求最小密钥长度，`GenerateHMACKeyString(method)` 生成的密钥总能满足，且熵足够。不要手写简单口令。
 
-### 3. `CachedParseToken` 适合重复校验场景
+### 3. `CachedParseToken` 用在重复校验场景
 
 适合：
 
 - 网关层重复校验相同 token
 - 同一请求链路中多次读取同一 token
 
-不太适合：
+### 4. 用 `RefreshToken` 做 Access Token 临期续签
 
-- 基本每次请求都是不同 token
+客户端在 token 临期时调用刷新接口，续到 `auth_time + refreshDuration` 为止；到达终点收到 `ErrRefreshExpired` 时引导重新登录。
+需要"随时可刷"时把 `WithRefreshWindow` 设为与 `WithTokenDuration` 相等。
 
-### 4. `RefreshToken` 适合 Access Token 临期续签
+### 5. 多实例黑名单落 Redis
 
-如果你的业务需要“任意时刻刷新”，当前实现不适合直接套用，建议单独设计 Refresh Token 体系。
+内存黑名单适用于单实例。多副本部署时把 `token_id` 存入 Redis，通过 `WithBlacklistCheckContextFunc` 接入。
 
-### 5. 多实例黑名单请落 Redis
+### 6. 密钥轮换用 `KeyRing`
 
-内存黑名单只适合单实例。如果你的服务是多副本部署，应把黑名单存外部存储。
+签发方给每把密钥配 `WithKeyID`，验证方用 `KeyRing` 注册新旧两把；等旧 token 全部过期后 `Unregister` 旧 kid。
+
+### 7. 验签方只拿公钥
+
+授权中心持私钥签发，其他服务用 `NewJwtRSAVerifierFromFile` / `NewJwtEd25519VerifierFromFile` 验签，私钥不出授权中心。
 
 ## 常见问题
 
 ### 为什么 `RefreshToken` 会返回 `ErrRefreshTooEarly`
 
-因为当前设计只允许“接近过期时刷新”，避免客户端在 token 刚发下来时就不断刷新。
+因为当前设计只允许"接近过期时刷新"，避免客户端在 token 刚发下来时就不断刷新。刷新窗口可用 `WithRefreshWindow` 调整。
+
+### 为什么 `RefreshToken` 会返回 `ErrRefreshExpired`
+
+会话已经到达 `auth_time + refreshDuration`。刷新链从首次签发起有上界，到期后需要重新登录。
 
 ### `CachedParseToken` 如何控制内存增长
 
 当前实现默认限制最多缓存 `4096` 条，并通过 LRU 淘汰和 token 过期时间惰性清扫控制内存增长。可通过 `WithCacheMaxEntries(n)` 调整容量，传 `0` 可关闭缓存路径。
-
-### 为什么黑名单不直接内置 Redis
-
-因为库本身希望保持无外部基础设施依赖。Redis 黑名单通常跟业务部署方式强相关，更适合由上层应用自己实现。
 
 ### 为什么内存黑名单还保留 `Add(tokenID string)`
 
@@ -1376,7 +1553,7 @@ if err != nil {
 # 运行全部测试
 go test ./...
 
-# 含数据竞争检测（CI 中必须开启）
+# 含数据竞争检测
 go test -race ./...
 
 # 查看测试覆盖率
@@ -1391,13 +1568,7 @@ go test -run=^$ -fuzz=FuzzPEMKeyParsers -fuzztime=5s .
 go test -run Example ./... -v
 ```
 
-当前测试覆盖情况：
-
-- 主包覆盖率：**约 85%**（核心操作 100%）
-- claims 子包覆盖率：**100%**
-- Example 测试：**5 个**
-- 数据竞争检测：**通过**（`go test -race`）
-- 全部测试数：**104 个**，全部通过
+测试覆盖单元测试、Example 测试、Benchmark、fuzz 与数据竞争检测。
 
 ## 兼容说明
 
@@ -1405,9 +1576,9 @@ go test -run Example ./... -v
 - `gojwt.Options` 仍可用，但已 deprecated
 - `claims.Option` 是当前推荐命名
 - `claims.Options` 仍可用，但已 deprecated
-- `GenerateSecureKey()` 仍可用，但已 deprecated，请迁移到 `GenerateSecureKeyString()`
+- `GenerateSecureKey()` / `GenerateSecureKeyString()` 仍可用，但已 deprecated，请迁移到 `GenerateHMACKeyString(method)`
 - `claims.WithExpiresAt()` 仍可用，但已 deprecated，请迁移到 `claims.WithExpiresIn()` 或 `claims.WithExpiresAtTime()`
 
 ## License
 
-如果需要开源发布，请按项目实际情况补充许可证文件。
+MIT，见仓库根目录的 `LICENSE` 文件。

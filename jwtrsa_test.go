@@ -291,13 +291,17 @@ func TestNewJwtRSARejectsUnsupportedSigningMethod(t *testing.T) {
 	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
 }
 
-func TestNewJwtRSARejectsKeyTooSmallForMethod(t *testing.T) {
+func TestNewJwtRSAKeySizeFollowsRFCMinimum(t *testing.T) {
 	priPath, pubPath := generateRSAKeyFiles(t, 2048)
 
-	_, err := gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithRSASigningMethod(jwtv5.SigningMethodRS384))
-	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
+	for _, method := range []jwtv5.SigningMethod{jwtv5.SigningMethodRS384, jwtv5.SigningMethodPS512} {
+		_, err := gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithRSASigningMethod(method))
+		require.NoError(t, err, method.Alg())
+	}
 
-	_, err = gojwt.NewJwtRSA(priPath, pubPath, gojwt.WithRSASigningMethod(jwtv5.SigningMethodPS512))
+	smallKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	require.NoError(t, err)
+	_, err = gojwt.NewJwtRSAFromKeys(smallKey, &smallKey.PublicKey)
 	require.ErrorIs(t, err, gojwt.ErrInvalidConfig)
 }
 
@@ -346,8 +350,9 @@ func TestJwtRSANilReceiverSafety(t *testing.T) {
 	require.ErrorIs(t, err, gojwt.ErrJWTNotInit)
 
 	results, errs := j.ParallelVerify([]string{"token"})
-	require.Nil(t, results)
-	require.Nil(t, errs)
+	require.Len(t, results, 1)
+	require.Len(t, errs, 1)
+	require.ErrorIs(t, errs[0], gojwt.ErrJWTNotInit)
 }
 
 // ---------- Tokener interface ----------

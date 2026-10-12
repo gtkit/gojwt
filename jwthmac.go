@@ -1,6 +1,7 @@
 package gojwt
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
@@ -20,51 +21,47 @@ type JwtHmac struct {
 
 // NewJwtHmac 创建 HMAC JWT 实例。
 // 默认使用 HS256，可通过 WithHMACSigningMethod 切换到 HS384 / HS512。
+// 密钥长度不足该算法最小要求时返回 ErrInvalidConfig；用 GenerateHMACKeyString 生成的密钥总能满足。
 func NewJwtHmac(secretKey []byte, options ...Option) (*JwtHmac, error) {
 	cfg, err := newConfig(options...)
 	if err != nil {
 		return nil, err
 	}
-
-	j := &JwtHmac{
-		secretKey: append([]byte(nil), secretKey...),
-		config:    cfg,
+	if cfg.rsaSigningSet {
+		return nil, fmt.Errorf("%w: RSA signing method option is not applicable to HMAC", ErrInvalidConfig)
 	}
-	signingMethod, err := resolveHMACSigningMethod(j.hmacSigningMethod, j.hmacSigningSet)
+
+	signingMethod, err := resolveHMACSigningMethod(cfg.hmacSigningMethod, cfg.hmacSigningSet)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateHMACSecretKey(j.secretKey, signingMethod); err != nil {
+	if err := validateHMACSecretKey(secretKey, signingMethod); err != nil {
 		return nil, err
 	}
-	j.signingMethod = signingMethod
 
-	return j, nil
+	return &JwtHmac{
+		secretKey:     bytes.Clone(secretKey),
+		signingMethod: signingMethod,
+		config:        cfg,
+	}, nil
 }
 
 // GenerateToken 根据用户 ID 生成 JWT token。
-// 自动写入 exp、iat、nbf 并生成唯一 TokenID。
+// 自动写入 exp、iat、nbf、auth_time 并生成唯一 TokenID。
 // 可通过 claims.Option 附加业务字段（角色、业务域、签发者等）。
 func (j *JwtHmac) GenerateToken(uid int64, options ...claims.Option) (string, error) {
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	return generateTokenImpl(&j.config, uid, options, func(cc *claims.Claims) (string, error) {
-		return createHmacToken(*cc, j.secretKey, j.signingMethod, j.keyID)
-	})
+	return generateTokenImpl(&j.config, uid, options, j.sign)
 }
 
 // RefreshToken 在刷新窗口内刷新 JWT token。
-// 仅当 token 距过期不足 refreshWindow（5 分钟）时允许刷新，
-// 否则返回 ErrRefreshTooEarly；超过 refreshDuration 则返回 ErrTokenExpired。
+// 仅当 token 距过期不足刷新窗口时允许刷新，否则返回 ErrRefreshTooEarly；
+// 会话已到 auth_time + refreshDuration 则返回 ErrRefreshExpired。
 // 刷新成功后会生成新的 TokenID/jti，并重置 iat、nbf，旧 token 与新 token 可独立吊销。
 func (j *JwtHmac) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (string, error) {
-	if j == nil {
-		return "", ErrJWTNotInit
-	}
-	return refreshTokenImplContext(context.Background(), &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return createHmacToken(*cc, j.secretKey, j.signingMethod, j.keyID)
-	})
+	return j.RefreshTokenContext(context.Background(), tokenString, opt...)
 }
 
 // RefreshTokenContext 在刷新窗口内刷新 JWT token，并尊重 ctx 取消和 deadline。
@@ -72,15 +69,12 @@ func (j *JwtHmac) RefreshTokenContext(ctx context.Context, tokenString string, o
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	return refreshTokenImplContext(ctx, &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return createHmacToken(*cc, j.secretKey, j.signingMethod, j.keyID)
-	})
+	return refreshTokenImplContext(ctx, &j.config, tokenString, opt, j.ParseTokenContext, j.sign)
 }
 
 // ParseToken 解析并验证 JWT token。
 // 完成签名验证、标准时间字段校验后返回 *claims.Claims。
-// 如果通过 WithBlacklistFunc 配置了黑名单检查函数，
-// 解析成功后会自动检查 tokenID 是否被拉黑。
+// 配置了黑名单或吊销回调时，解析成功后会自动执行吊销检查。
 func (j *JwtHmac) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	return j.ParseTokenContext(context.Background(), tokenString, opt...)
 }
@@ -97,7 +91,7 @@ func (j *JwtHmac) ParseTokenContext(ctx context.Context, tokenString string, opt
 
 // CachedParseToken 带缓存的 ParseToken，相同 tokenString 不重复解析。
 // 返回的是 Claims 的深拷贝副本，调用方修改不会影响缓存。
-// 即使缓存命中，仍会检查黑名单（token 可能在缓存后被加入黑名单）。
+// 即使缓存命中，仍会执行吊销检查（token 可能在缓存后被吊销）。
 // 当调用方传入 ParserOption 时，为避免缓存绕过更严格的校验条件，会直接退化为 ParseToken。
 func (j *JwtHmac) CachedParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	return j.CachedParseTokenContext(context.Background(), tokenString, opt...)
@@ -114,25 +108,20 @@ func (j *JwtHmac) CachedParseTokenContext(ctx context.Context, tokenString strin
 // ParallelVerify 并发验证多个 token。
 // results[i] 与 errs[i] 对应同一个输入 tokens[i]。
 func (j *JwtHmac) ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
-	if j == nil {
-		return nil, nil
-	}
-	return parallelVerifyImpl(tokens, opt, j.ParseToken)
+	return j.ParallelVerifyContext(context.Background(), tokens, opt...)
 }
 
 // ParallelVerifyContext 并发验证多个 token，并在 ctx 取消后停止分发未开始的任务。
 // results[i] 与 errs[i] 对应同一个输入 tokens[i]。
 func (j *JwtHmac) ParallelVerifyContext(ctx context.Context, tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
 	if j == nil {
-		return nil, nil
+		return notInitResults(len(tokens))
 	}
 	return parallelVerifyImplContext(ctx, tokens, opt, j.ParseTokenContext)
 }
 
-// createHmacToken 使用指定的 HMAC-SHA 签名算法并返回 token 字符串。
-// keyID 非空时写入 header 的 kid。
-func createHmacToken(claims claims.Claims, signKey any, signingMethod *jwtv5.SigningMethodHMAC, keyID string) (string, error) {
-	return signToken(signingMethod, claims, keyID, signKey)
+func (j *JwtHmac) sign(tokenClaims *claims.Claims) (string, error) {
+	return signToken(j.signingMethod, tokenClaims, j.keyID, j.secretKey)
 }
 
 func resolveHMACSigningMethod(method *jwtv5.SigningMethodHMAC, configured bool) (*jwtv5.SigningMethodHMAC, error) {
@@ -163,6 +152,7 @@ func validateHMACSecretKey(secretKey []byte, signingMethod *jwtv5.SigningMethodH
 	return nil
 }
 
+// minHMACKeySize 按 RFC 7518 §3.2 返回各算法的最小密钥长度：与哈希输出等长。
 func minHMACKeySize(signingMethod *jwtv5.SigningMethodHMAC) int {
 	switch signingMethod.Alg() {
 	case jwtv5.SigningMethodHS384.Alg():

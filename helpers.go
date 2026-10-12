@@ -17,10 +17,6 @@ import (
 	"github.com/gtkit/gojwt/claims"
 )
 
-// refreshWindow 是允许刷新 token 的时间窗口。
-// 只有当 token 距过期不足此时长时，RefreshToken 才允许执行。
-const refreshWindow = 5 * time.Minute
-
 // cacheSweepInterval 是缓存惰性清扫的最小间隔。
 const cacheSweepInterval = 5 * time.Minute
 
@@ -43,11 +39,18 @@ type claimsCache struct {
 	lastSweep time.Time
 }
 
-// normalizeParseError 将 golang-jwt 的内部错误归一化为本包的 sentinel error。
+// normalizeParseError 将 golang-jwt 的内部错误归一化为本包的 sentinel error，
+// 同时用 %w 保留底层原因，errors.Is 判定 sentinel 与排障读根因两不误。
 func normalizeParseError(err error) error {
+	sentinel := matchParseSentinel(err)
+	if sentinel == nil {
+		return err
+	}
+	return fmt.Errorf("%w: %w", sentinel, err)
+}
+
+func matchParseSentinel(err error) error {
 	switch {
-	case err == nil:
-		return nil
 	case errors.Is(err, jwtv5.ErrTokenInvalidIssuer):
 		return ErrTokenInvalidIssuer
 	case errors.Is(err, jwtv5.ErrTokenInvalidAudience):
@@ -73,7 +76,7 @@ func normalizeParseError(err error) error {
 	case errors.Is(err, jwtv5.ErrTokenInvalidClaims):
 		return ErrTokenInvalidClaims
 	default:
-		return err
+		return nil
 	}
 }
 
@@ -108,20 +111,36 @@ func storeCachedClaims(cache *claimsCache, maxEntries int, token string, tokenCl
 }
 
 // refreshTokenClaims 检查刷新条件并轮换 TokenID、更新时间字段。
-// 超过 refreshDuration 返回 ErrTokenExpired，
-// 未进入刷新窗口返回 ErrRefreshTooEarly。
-// 刷新成功后会生成新的 TokenID，并更新 iat、nbf、exp。
-func refreshTokenClaims(tokenClaims *claims.Claims, tokenDuration, refreshDuration time.Duration) error {
+//
+// 会话终点为 auth_time + refreshDuration，旧 token 无 auth_time 时以其 iat 为起点：
+// 已到终点返回 ErrRefreshExpired；距过期仍超过 refreshWindow 返回 ErrRefreshTooEarly。
+// 新 token 保留旧 token 的有效时长（exp - iat），但 exp 不越过会话终点，
+// 因此刷新链上任何 token 都不会活过终点。
+func refreshTokenClaims(tokenClaims *claims.Claims, cfg *config) error {
 	if tokenClaims == nil || tokenClaims.ExpiresAt == nil || tokenClaims.IssuedAt == nil {
 		return ErrTokenInvalid
 	}
 
 	now := time.Now()
-	if now.Sub(tokenClaims.IssuedAt.Time) > refreshDuration {
-		return ErrTokenExpired
+	authTime := tokenClaims.IssuedAt.Time
+	if tokenClaims.AuthTime != nil {
+		authTime = tokenClaims.AuthTime.Time
 	}
-	if time.Until(tokenClaims.ExpiresAt.Time) >= refreshWindow {
+	sessionEnd := authTime.Add(cfg.refreshDuration)
+	if !now.Before(sessionEnd) {
+		return ErrRefreshExpired
+	}
+	if time.Until(tokenClaims.ExpiresAt.Time) > cfg.refreshWindow {
 		return ErrRefreshTooEarly
+	}
+
+	lifetime := tokenClaims.ExpiresAt.Time.Sub(tokenClaims.IssuedAt.Time)
+	if lifetime <= 0 {
+		lifetime = cfg.tokenDuration
+	}
+	expiresAt := now.Add(lifetime)
+	if expiresAt.After(sessionEnd) {
+		expiresAt = sessionEnd
 	}
 
 	newTokenID, err := generateTokenID()
@@ -130,7 +149,9 @@ func refreshTokenClaims(tokenClaims *claims.Claims, tokenDuration, refreshDurati
 	}
 
 	tokenClaims.TokenID = newTokenID
-	tokenClaims.ExpiresAt = jwtv5.NewNumericDate(now.Add(tokenDuration))
+	tokenClaims.ID = newTokenID
+	tokenClaims.AuthTime = jwtv5.NewNumericDate(authTime)
+	tokenClaims.ExpiresAt = jwtv5.NewNumericDate(expiresAt)
 	tokenClaims.IssuedAt = jwtv5.NewNumericDate(now)
 	tokenClaims.NotBefore = jwtv5.NewNumericDate(now)
 	return nil
@@ -222,44 +243,31 @@ func isCachedClaimsExpired(entry cachedClaims, now time.Time) bool {
 	return !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt)
 }
 
-// checkBlacklistContext 根据配置执行黑名单检查，并将 ctx 透传给支持 context 的检查函数。
-func checkBlacklistContext(ctx context.Context, cfg *config, tokenID string) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+// checkRevocation 依次执行 tokenID 黑名单检查与 claims 级吊销回调。
+// 解析路径与缓存命中路径都经过这里，缓存不会成为吊销的绕过口。
+// tokenID 为空的 token 没有可查的黑名单键，只走吊销回调。
+func checkRevocation(ctx context.Context, cfg *config, tokenClaims *claims.Claims) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if cfg == nil || tokenID == "" {
-		return nil
-	}
-
-	if cfg.blacklistCheckContextFunc != nil {
-		blacklisted, err := cfg.blacklistCheckContextFunc(ctx, tokenID)
+	if cfg.blacklistCheck != nil && tokenClaims.TokenID != "" {
+		revoked, err := cfg.blacklistCheck(ctx, tokenClaims.TokenID)
 		if err != nil {
 			return fmt.Errorf("check token blacklist: %w", err)
 		}
-		if blacklisted {
+		if revoked {
 			return ErrTokenBlacklisted
 		}
-		return nil
 	}
-
-	if cfg.blacklistCheckFunc != nil {
-		blacklisted, err := cfg.blacklistCheckFunc(tokenID)
+	if cfg.revocationCheck != nil {
+		revoked, err := cfg.revocationCheck(ctx, tokenClaims)
 		if err != nil {
-			return fmt.Errorf("check token blacklist: %w", err)
+			return fmt.Errorf("check token revocation: %w", err)
 		}
-		if blacklisted {
+		if revoked {
 			return ErrTokenBlacklisted
 		}
-		return nil
 	}
-
-	if cfg.isBlacklisted != nil && cfg.isBlacklisted(tokenID) {
-		return ErrTokenBlacklisted
-	}
-
 	return nil
 }
 
@@ -272,6 +280,8 @@ func cloneClaims(src *claims.Claims) *claims.Claims {
 	dst := *src
 	dst.RegisteredClaims = cloneRegisteredClaims(src.RegisteredClaims)
 	dst.Roles = slices.Clone(src.Roles)
+	dst.AuthTime = cloneNumericDate(src.AuthTime)
+	dst.Ext = cloneExtMap(src.Ext)
 	return &dst
 }
 
@@ -293,6 +303,34 @@ func cloneNumericDate(src *jwtv5.NumericDate) *jwtv5.NumericDate {
 	return jwtv5.NewNumericDate(src.Time)
 }
 
+// cloneExtMap 递归拷贝扩展字段。JSON 解码只会产出 map[string]any 与 []any 两种容器，
+// 其余值都是标量，按值复制即可。
+func cloneExtMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = cloneExtValue(value)
+	}
+	return dst
+}
+
+func cloneExtValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		return cloneExtMap(v)
+	case []any:
+		dst := make([]any, len(v))
+		for i, item := range v {
+			dst[i] = cloneExtValue(item)
+		}
+		return dst
+	default:
+		return value
+	}
+}
+
 // alignTokenIdentifiers 保证业务 TokenID 与标准 jti 始终一致。
 func alignTokenIdentifiers(tokenClaims *claims.Claims, generatedTokenID string) {
 	if tokenClaims == nil {
@@ -306,6 +344,16 @@ func alignTokenIdentifiers(tokenClaims *claims.Claims, generatedTokenID string) 
 		tokenClaims.TokenID = generatedTokenID
 	}
 	tokenClaims.ID = tokenClaims.TokenID
+}
+
+// notInitResults 返回 nil receiver 上并发验签的结果：与输入等长，错误全部为 ErrJWTNotInit，
+// 调用方按输入下标读取不会越界。
+func notInitResults(n int) ([]*claims.Claims, []error) {
+	errs := make([]error, n)
+	for i := range errs {
+		errs[i] = ErrJWTNotInit
+	}
+	return make([]*claims.Claims, n), errs
 }
 
 // parallelVerifyClaimsContext 使用有界 worker pool 并发验证多个 token，并尊重 ctx 取消。
@@ -380,8 +428,9 @@ func generateTokenImpl(cfg *config, uid int64, options []claims.Option, signFn f
 
 	now := time.Now()
 	tokenClaims := &claims.Claims{
-		UserID:  uid,
-		TokenID: tokenID,
+		UserID:   uid,
+		TokenID:  tokenID,
+		AuthTime: jwtv5.NewNumericDate(now),
 		RegisteredClaims: jwtv5.RegisteredClaims{
 			ExpiresAt: jwtv5.NewNumericDate(now.Add(cfg.tokenDuration)),
 			NotBefore: jwtv5.NewNumericDate(now),
@@ -402,7 +451,9 @@ func generateTokenImpl(cfg *config, uid int64, options []claims.Option, signFn f
 }
 
 // parseTokenImplContext 是 ParseTokenContext 的通用实现。
-// cfg 提供 parseLeeway，keyFunc 由具体实现提供（获取验签密钥并验证算法）。
+// 解析选项按 包内默认 → 实例级 WithParserOptions → 单次调用 的顺序应用；
+// 默认要求 exp 存在并校验 iat，本包签发的 token 天然满足。
+// keyFunc 由具体实现提供（获取验签密钥并验证算法）。
 func parseTokenImplContext(ctx context.Context, cfg *config, tokenString string, opt []jwtv5.ParserOption, keyFunc func(*jwtv5.Token) (any, error), expectedAlg string) (*claims.Claims, error) {
 	if tokenString == "" {
 		return nil, ErrTokenMalformed
@@ -414,10 +465,15 @@ func parseTokenImplContext(ctx context.Context, cfg *config, tokenString string,
 		return nil, err
 	}
 
-	parserOptions := append([]jwtv5.ParserOption{
+	parserOptions := make([]jwtv5.ParserOption, 0, 4+len(cfg.parserOptions)+len(opt))
+	parserOptions = append(parserOptions,
 		jwtv5.WithValidMethods([]string{expectedAlg}),
 		jwtv5.WithLeeway(cfg.parseLeeway),
-	}, opt...)
+		jwtv5.WithExpirationRequired(),
+		jwtv5.WithIssuedAt(),
+	)
+	parserOptions = append(parserOptions, cfg.parserOptions...)
+	parserOptions = append(parserOptions, opt...)
 	token, err := jwtv5.ParseWithClaims(tokenString, &claims.Claims{}, func(token *jwtv5.Token) (any, error) {
 		if token.Method == nil || token.Method.Alg() != expectedAlg {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -433,7 +489,7 @@ func parseTokenImplContext(ctx context.Context, cfg *config, tokenString string,
 		return nil, ErrTokenInvalid
 	}
 
-	if err := checkBlacklistContext(ctx, cfg, c.TokenID); err != nil {
+	if err := checkRevocation(ctx, cfg, c); err != nil {
 		return nil, err
 	}
 
@@ -448,11 +504,10 @@ func refreshTokenImplContext(ctx context.Context, cfg *config, tokenString strin
 		return "", err
 	}
 
-	if err := refreshTokenClaims(tokenClaims, cfg.tokenDuration, cfg.refreshDuration); err != nil {
+	if err := refreshTokenClaims(tokenClaims, cfg); err != nil {
 		return "", err
 	}
 
-	tokenClaims.ID = tokenClaims.TokenID
 	return signFn(tokenClaims)
 }
 
@@ -468,15 +523,12 @@ func cachedParseTokenImplContext(ctx context.Context, cfg *config, cache *claims
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(opt) > 0 {
-		return parseFn(ctx, tokenString, opt...)
-	}
-	if cfg == nil || cfg.cacheMaxEntries <= 0 {
+	if len(opt) > 0 || cfg.cacheMaxEntries <= 0 {
 		return parseFn(ctx, tokenString, opt...)
 	}
 
 	if c, ok := loadCachedClaims(cache, tokenString); ok {
-		if err := checkBlacklistContext(ctx, cfg, c.TokenID); err != nil {
+		if err := checkRevocation(ctx, cfg, c); err != nil {
 			return nil, err
 		}
 		return c, nil
@@ -522,6 +574,7 @@ func signToken(method jwtv5.SigningMethod, tokenClaims jwtv5.Claims, keyID strin
 // 返回的 kid 因此来自未经验证的数据，调用方可以用它挑选密钥，
 // 但必须再用选中的密钥走一次 ParseToken 完成验签，
 // 不能拿它直接做任何鉴权或授权判断。
+// 多把密钥并存时优先使用 KeyRing，它把选键与验签合成一次调用。
 //
 // 使用示例：
 //
@@ -531,7 +584,7 @@ func signToken(method jwtv5.SigningMethod, tokenClaims jwtv5.Claims, keyID strin
 //	}
 //	j, ok := jwtByKeyID[kid]
 //	if !ok {
-//	    return gojwt.ErrInvalidKey
+//	    return gojwt.ErrUnknownKeyID
 //	}
 //	cc, err := j.ParseToken(tokenString) // 验签在这一步完成
 func ParseKeyID(tokenString string) (string, error) {

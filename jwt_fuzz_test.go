@@ -1,10 +1,6 @@
 package gojwt
 
-import (
-	"os"
-	"path/filepath"
-	"testing"
-)
+import "testing"
 
 func FuzzJwtHmacParseToken(f *testing.F) {
 	j, err := NewJwtHmac([]byte("12345678901234567890123456789012"))
@@ -51,15 +47,9 @@ func FuzzPEMKeyParsers(f *testing.F) {
 			t.Skip()
 		}
 
-		path := filepath.Join(t.TempDir(), "key.pem")
-		if err := os.WriteFile(path, data, 0o600); err != nil {
-			t.Fatalf("write fuzz key: %v", err)
-		}
-
-		_, _ = readPEMBlock(path)
-		_, _ = readEd25519PrivateKey(path)
-		_, _ = readEd25519PublicKey(path)
-		_, _ = readRSAPrivateKey(path)
-		_, _ = readRSAPublicKey(path)
+		_, _ = ParseEd25519PrivateKeyPEM(data)
+		_, _ = ParseEd25519PublicKeyPEM(data)
+		_, _ = ParseRSAPrivateKeyPEM(data)
+		_, _ = ParseRSAPublicKeyPEM(data)
 	})
 }

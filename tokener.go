@@ -2,11 +2,12 @@ package gojwt
 
 import (
 	"context"
+
 	jwtv5 "github.com/golang-jwt/jwt/v5"
 	"github.com/gtkit/gojwt/claims"
 )
 
-// 编译期确保所有实现满足 Tokener 接口。
+// 编译期确保所有实现满足对应接口。
 var (
 	_ Tokener        = (*JwtHmac)(nil)
 	_ Tokener        = (*JwtEd25519)(nil)
@@ -14,11 +15,19 @@ var (
 	_ ContextTokener = (*JwtHmac)(nil)
 	_ ContextTokener = (*JwtEd25519)(nil)
 	_ ContextTokener = (*JwtRSA)(nil)
+	_ Issuer         = (*JwtHmac)(nil)
+	_ Issuer         = (*JwtEd25519)(nil)
+	_ Issuer         = (*JwtRSA)(nil)
+	_ Verifier       = (*JwtHmac)(nil)
+	_ Verifier       = (*JwtEd25519)(nil)
+	_ Verifier       = (*JwtRSA)(nil)
+	_ Verifier       = (*KeyRing)(nil)
 )
 
 // Tokener 提供算法无关的 JWT 操作接口。
 // JwtHmac、JwtEd25519 和 JwtRSA 均实现了此接口，
 // 调用方可面向 Tokener 编程，在 HMAC、Ed25519 与 RSA 之间自由切换。
+// 只需要解析能力时面向 Verifier 编程，只需要签发能力时面向 Issuer 编程。
 type Tokener interface {
 	// GenerateToken 根据用户 ID 和可选的 claims 选项生成 JWT。
 	GenerateToken(uid int64, options ...claims.Option) (string, error)
@@ -64,4 +73,28 @@ type ContextTokener interface {
 	ContextRefresher
 	ContextCachedParser
 	ContextParallelVerifier
+}
+
+// Verifier 只包含解析类方法，供只持公钥的验签方与网关面向接口编程。
+// JwtHmac、JwtEd25519、JwtRSA 与 KeyRing 均实现了此接口。
+type Verifier interface {
+	ContextParser
+	ContextCachedParser
+	ContextParallelVerifier
+	// ParseToken 解析并验证 JWT，返回解析后的 Claims。
+	ParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error)
+	// CachedParseToken 带缓存的 ParseToken，相同 token 不重复解析。
+	CachedParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error)
+	// ParallelVerify 并发验证多个 token，返回结果和错误数组（按下标对应）。
+	ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error)
+}
+
+// Issuer 包含签发与刷新方法。JwtHmac、JwtEd25519、JwtRSA 均实现了此接口；
+// 只持公钥的验签实例调用这些方法返回 ErrNoSigningKey。
+type Issuer interface {
+	ContextRefresher
+	// GenerateToken 根据用户 ID 和可选的 claims 选项生成 JWT。
+	GenerateToken(uid int64, options ...claims.Option) (string, error)
+	// RefreshToken 在刷新窗口内刷新 JWT，返回新的 token 字符串。
+	RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (string, error)
 }

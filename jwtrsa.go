@@ -11,10 +11,15 @@ import (
 	"github.com/gtkit/gojwt/claims"
 )
 
+// minRSAKeyBits 是 RFC 7518 §3.3 对 RS/PS 全系列算法要求的最小模数长度。
+const minRSAKeyBits = 2048
+
 // JwtRSA 基于 RSA 签名的 JWT 实例。
 // 默认使用 RS256，可通过 WithRSASigningMethod 切换到
 // RS384 / RS512（PKCS1-v1_5）或 PS256 / PS384 / PS512（PSS）。
 // JwtRSA 可被多个 goroutine 并发使用。
+// 通过 NewJwtRSAVerifier / NewJwtRSAVerifierFromFile 创建的实例只持公钥，
+// 其 GenerateToken / RefreshToken 返回 ErrNoSigningKey。
 type JwtRSA struct {
 	privateKey    *rsa.PrivateKey
 	publicKey     *rsa.PublicKey
@@ -24,103 +29,104 @@ type JwtRSA struct {
 }
 
 // NewJwtRSA 从 PEM 文件加载 RSA 密钥对，创建 JWT 实例。
-// priPath 为 PKCS1 或 PKCS8 格式私钥路径，pubPath 为 PKIX 格式公钥路径。
+// priPath 为 PKCS1 或 PKCS8 格式私钥路径，pubPath 为 PKIX 或 PKCS1 格式公钥路径；两者不匹配返回 ErrInvalidKey。
 // 默认使用 RS256，可通过 WithRSASigningMethod 切换算法。
 func NewJwtRSA(priPath, pubPath string, options ...Option) (*JwtRSA, error) {
-	privateKey, err := readRSAPrivateKey(priPath)
+	privateKey, err := parseKeyFile(priPath, ParseRSAPrivateKeyPEM)
 	if err != nil {
 		return nil, err
 	}
-	publicKey, err := readRSAPublicKey(pubPath)
+	publicKey, err := parseKeyFile(pubPath, ParseRSAPublicKeyPEM)
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := newConfig(options...)
-	if err != nil {
-		return nil, err
-	}
-
-	j := &JwtRSA{
-		privateKey: privateKey,
-		publicKey:  publicKey,
-		config:     cfg,
-	}
-	if j.hmacSigningSet {
-		return nil, fmt.Errorf("%w: HMAC signing method option is not applicable to RSA", ErrInvalidConfig)
-	}
-
-	signingMethod, err := resolveRSASigningMethod(j.rsaSigningMethod, j.rsaSigningSet)
-	if err != nil {
-		return nil, err
-	}
-	j.signingMethod = signingMethod
-
-	if err := prepareRSAKeys(j, signingMethod); err != nil {
-		return nil, err
-	}
-
-	return j, nil
+	return newJwtRSA(privateKey, publicKey, options)
 }
 
 // NewJwtRSAFromKeys 直接使用内存中的 RSA 密钥对创建 JWT 实例。
-// 适用于密钥来自 KMS、Vault 等外部系统的场景。
+// 适用于密钥来自 KMS、Vault 等外部系统的场景，PEM 字节可先用 ParseRSAPrivateKeyPEM /
+// ParseRSAPublicKeyPEM 解析。输入密钥会被复制，构造后修改入参不影响实例。
 func NewJwtRSAFromKeys(privateKey *rsa.PrivateKey, publicKey *rsa.PublicKey, options ...Option) (*JwtRSA, error) {
 	if privateKey == nil {
 		return nil, fmt.Errorf("%w: RSA private key must not be nil", ErrInvalidKey)
 	}
-	if publicKey == nil {
-		return nil, fmt.Errorf("%w: RSA public key must not be nil", ErrInvalidKey)
+	return newJwtRSA(privateKey, publicKey, options)
+}
+
+// NewJwtRSAVerifier 使用内存中的 RSA 公钥创建只做验签的实例。
+// 适用于只持公钥的服务、网关，以及持有第三方公钥验签其 RS/PS 系列 token 的场景。
+func NewJwtRSAVerifier(publicKey *rsa.PublicKey, options ...Option) (*JwtRSA, error) {
+	return newJwtRSA(nil, publicKey, options)
+}
+
+// NewJwtRSAVerifierFromFile 从 PEM 文件加载 RSA 公钥，创建只做验签的实例。
+func NewJwtRSAVerifierFromFile(pubPath string, options ...Option) (*JwtRSA, error) {
+	publicKey, err := parseKeyFile(pubPath, ParseRSAPublicKeyPEM)
+	if err != nil {
+		return nil, err
 	}
+	return newJwtRSA(nil, publicKey, options)
+}
+
+func newJwtRSA(privateKey *rsa.PrivateKey, publicKey *rsa.PublicKey, options []Option) (*JwtRSA, error) {
 	cfg, err := newConfig(options...)
 	if err != nil {
 		return nil, err
 	}
-
-	j := &JwtRSA{
-		privateKey: privateKey,
-		publicKey:  publicKey,
-		config:     cfg,
-	}
-	if j.hmacSigningSet {
+	if cfg.hmacSigningSet {
 		return nil, fmt.Errorf("%w: HMAC signing method option is not applicable to RSA", ErrInvalidConfig)
 	}
-
-	signingMethod, err := resolveRSASigningMethod(j.rsaSigningMethod, j.rsaSigningSet)
+	signingMethod, err := resolveRSASigningMethod(cfg.rsaSigningMethod, cfg.rsaSigningSet)
 	if err != nil {
 		return nil, err
 	}
-	j.signingMethod = signingMethod
 
-	if err := prepareRSAKeys(j, signingMethod); err != nil {
+	j := &JwtRSA{signingMethod: signingMethod, config: cfg}
+	j.publicKey, err = cloneRSAPublicKey(publicKey)
+	if err != nil {
 		return nil, err
 	}
+	if bits := j.publicKey.N.BitLen(); bits < minRSAKeyBits {
+		return nil, fmt.Errorf("%w: RSA key must be at least %d bits, got %d", ErrInvalidConfig, minRSAKeyBits, bits)
+	}
+	if privateKey == nil {
+		return j, nil
+	}
 
+	j.privateKey, err = cloneRSAPrivateKey(privateKey)
+	if err != nil {
+		return nil, err
+	}
+	if j.privateKey.N.Cmp(j.publicKey.N) != 0 || j.privateKey.E != j.publicKey.E {
+		return nil, fmt.Errorf("%w: RSA private and public keys do not match", ErrInvalidKey)
+	}
+	j.privateKey.Precompute()
+	if err := j.privateKey.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: validate RSA private key: %w", ErrInvalidKey, err)
+	}
 	return j, nil
 }
 
 // GenerateToken 根据用户 ID 生成 JWT token。
-// 自动写入 exp、iat、nbf 并生成唯一 TokenID。
-// 可通过 claims.Option 附加业务字段。
+// 自动写入 exp、iat、nbf、auth_time 并生成唯一 TokenID。
+// 可通过 claims.Option 附加业务字段。只持公钥的实例返回 ErrNoSigningKey。
 func (j *JwtRSA) GenerateToken(uid int64, options ...claims.Option) (string, error) {
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	return generateTokenImpl(&j.config, uid, options, func(cc *claims.Claims) (string, error) {
-		return signToken(j.signingMethod, cc, j.keyID, j.privateKey)
-	})
+	if j.privateKey == nil {
+		return "", ErrNoSigningKey
+	}
+	return generateTokenImpl(&j.config, uid, options, j.sign)
 }
 
 // RefreshToken 在刷新窗口内刷新 JWT token。
-// 仅当 token 距过期不足 refreshWindow（5 分钟）时允许刷新，
-// 否则返回 ErrRefreshTooEarly；超过 refreshDuration 则返回 ErrTokenExpired。
+// 仅当 token 距过期不足刷新窗口时允许刷新，否则返回 ErrRefreshTooEarly；
+// 会话已到 auth_time + refreshDuration 则返回 ErrRefreshExpired。
 // 刷新成功后会生成新的 TokenID/jti，并重置 iat、nbf，旧 token 与新 token 可独立吊销。
+// 只持公钥的实例返回 ErrNoSigningKey。
 func (j *JwtRSA) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (string, error) {
-	if j == nil {
-		return "", ErrJWTNotInit
-	}
-	return refreshTokenImplContext(context.Background(), &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return signToken(j.signingMethod, cc, j.keyID, j.privateKey)
-	})
+	return j.RefreshTokenContext(context.Background(), tokenString, opt...)
 }
 
 // RefreshTokenContext 在刷新窗口内刷新 JWT token，并尊重 ctx 取消和 deadline。
@@ -128,15 +134,15 @@ func (j *JwtRSA) RefreshTokenContext(ctx context.Context, tokenString string, op
 	if j == nil {
 		return "", ErrJWTNotInit
 	}
-	return refreshTokenImplContext(ctx, &j.config, tokenString, opt, j.ParseTokenContext, func(cc *claims.Claims) (string, error) {
-		return signToken(j.signingMethod, cc, j.keyID, j.privateKey)
-	})
+	if j.privateKey == nil {
+		return "", ErrNoSigningKey
+	}
+	return refreshTokenImplContext(ctx, &j.config, tokenString, opt, j.ParseTokenContext, j.sign)
 }
 
 // ParseToken 解析并验证 JWT token。
 // 完成 RSA 签名验证后返回 *claims.Claims。
-// 如果通过 WithBlacklistFunc 配置了黑名单检查函数，
-// 解析成功后会自动检查 tokenID 是否被拉黑。
+// 配置了黑名单或吊销回调时，解析成功后会自动执行吊销检查。
 func (j *JwtRSA) ParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	return j.ParseTokenContext(context.Background(), tokenString, opt...)
 }
@@ -152,7 +158,7 @@ func (j *JwtRSA) ParseTokenContext(ctx context.Context, tokenString string, opt 
 }
 
 // CachedParseToken 带缓存的 ParseToken，相同 tokenString 不重复解析。
-// 即使缓存命中，仍会检查黑名单。
+// 即使缓存命中，仍会执行吊销检查。
 // 当调用方传入 ParserOption 时，为避免缓存绕过更严格的校验条件，会直接退化为 ParseToken。
 func (j *JwtRSA) CachedParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error) {
 	return j.CachedParseTokenContext(context.Background(), tokenString, opt...)
@@ -169,36 +175,42 @@ func (j *JwtRSA) CachedParseTokenContext(ctx context.Context, tokenString string
 // ParallelVerify 并发验证多个 token。
 // results[i] 与 errs[i] 对应同一个输入 tokens[i]。
 func (j *JwtRSA) ParallelVerify(tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
-	if j == nil {
-		return nil, nil
-	}
-	return parallelVerifyImpl(tokens, opt, j.ParseToken)
+	return j.ParallelVerifyContext(context.Background(), tokens, opt...)
 }
 
 // ParallelVerifyContext 并发验证多个 token，并在 ctx 取消后停止分发未开始的任务。
 // results[i] 与 errs[i] 对应同一个输入 tokens[i]。
 func (j *JwtRSA) ParallelVerifyContext(ctx context.Context, tokens []string, opt ...jwtv5.ParserOption) ([]*claims.Claims, []error) {
 	if j == nil {
-		return nil, nil
+		return notInitResults(len(tokens))
 	}
 	return parallelVerifyImplContext(ctx, tokens, opt, j.ParseTokenContext)
 }
 
-// readRSAPrivateKey 从 PEM 文件读取 RSA 私钥。
-// 支持 "RSA PRIVATE KEY"（PKCS1 格式）和 "PRIVATE KEY"（PKCS8 格式）。
-func readRSAPrivateKey(path string) (*rsa.PrivateKey, error) {
-	block, err := readPEMBlock(path)
+func (j *JwtRSA) sign(tokenClaims *claims.Claims) (string, error) {
+	return signToken(j.signingMethod, tokenClaims, j.keyID, j.privateKey)
+}
+
+// ParseRSAPrivateKeyPEM 解析 PEM 编码的 RSA 私钥。
+// 支持 "RSA PRIVATE KEY"（PKCS1）与 "PRIVATE KEY"（PKCS8）两种块类型。
+// PEM 解码失败、结构解析失败返回 ErrInvalidKey；PKCS8 中不是 RSA 密钥返回 ErrInvalidKeyType。
+func ParseRSAPrivateKeyPEM(data []byte) (*rsa.PrivateKey, error) {
+	block, err := decodePEMBlock(data)
 	if err != nil {
 		return nil, err
 	}
 
 	switch block.Type {
 	case "RSA PRIVATE KEY":
-		return x509.ParsePKCS1PrivateKey(block.Bytes)
+		key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("%w: parse PKCS1 private key: %w", ErrInvalidKey, err)
+		}
+		return key, nil
 	case "PRIVATE KEY":
 		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("parse private key: %w", err)
+			return nil, fmt.Errorf("%w: parse PKCS8 private key: %w", ErrInvalidKey, err)
 		}
 		rsaKey, ok := key.(*rsa.PrivateKey)
 		if !ok {
@@ -206,25 +218,30 @@ func readRSAPrivateKey(path string) (*rsa.PrivateKey, error) {
 		}
 		return rsaKey, nil
 	default:
-		return nil, fmt.Errorf("invalid private key PEM type: %s", block.Type)
+		return nil, fmt.Errorf("%w: unsupported private key PEM type %q", ErrInvalidKey, block.Type)
 	}
 }
 
-// readRSAPublicKey 从 PEM 文件读取 RSA 公钥。
-// 支持 "RSA PUBLIC KEY"（PKCS1 格式）和 "PUBLIC KEY"（PKIX 格式）。
-func readRSAPublicKey(path string) (*rsa.PublicKey, error) {
-	block, err := readPEMBlock(path)
+// ParseRSAPublicKeyPEM 解析 PEM 编码的 RSA 公钥。
+// 支持 "RSA PUBLIC KEY"（PKCS1）与 "PUBLIC KEY"（PKIX）两种块类型。
+// PEM 解码失败、结构解析失败返回 ErrInvalidKey；PKIX 中不是 RSA 密钥返回 ErrInvalidKeyType。
+func ParseRSAPublicKeyPEM(data []byte) (*rsa.PublicKey, error) {
+	block, err := decodePEMBlock(data)
 	if err != nil {
 		return nil, err
 	}
 
 	switch block.Type {
 	case "RSA PUBLIC KEY":
-		return x509.ParsePKCS1PublicKey(block.Bytes)
+		key, err := x509.ParsePKCS1PublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("%w: parse PKCS1 public key: %w", ErrInvalidKey, err)
+		}
+		return key, nil
 	case "PUBLIC KEY":
 		key, err := x509.ParsePKIXPublicKey(block.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("parse public key: %w", err)
+			return nil, fmt.Errorf("%w: parse PKIX public key: %w", ErrInvalidKey, err)
 		}
 		rsaKey, ok := key.(*rsa.PublicKey)
 		if !ok {
@@ -232,7 +249,7 @@ func readRSAPublicKey(path string) (*rsa.PublicKey, error) {
 		}
 		return rsaKey, nil
 	default:
-		return nil, fmt.Errorf("invalid public key PEM type: %s", block.Type)
+		return nil, fmt.Errorf("%w: unsupported public key PEM type %q", ErrInvalidKey, block.Type)
 	}
 }
 
@@ -258,48 +275,6 @@ func resolveRSASigningMethod(method jwtv5.SigningMethod, configured bool) (jwtv5
 	}
 }
 
-// validateRSAKeySize 根据签名算法验证 RSA 密钥长度。
-// RS256/PS256 要求至少 2048 bit，RS384/PS384 要求至少 3072 bit，
-// RS512/PS512 要求至少 4096 bit。
-func validateRSAKeySize(key *rsa.PrivateKey, method jwtv5.SigningMethod) error {
-	if key == nil {
-		return fmt.Errorf("%w: RSA private key must not be nil", ErrInvalidKey)
-	}
-
-	keyBits := key.N.BitLen()
-	minBits := minRSAKeyBits(method)
-	if keyBits < minBits {
-		return fmt.Errorf("%w: RSA key must be at least %d bits for %s, got %d",
-			ErrInvalidConfig, minBits, method.Alg(), keyBits)
-	}
-	return nil
-}
-
-func prepareRSAKeys(j *JwtRSA, signingMethod jwtv5.SigningMethod) error {
-	privateKey, err := cloneRSAPrivateKey(j.privateKey)
-	if err != nil {
-		return err
-	}
-	publicKey, err := cloneRSAPublicKey(j.publicKey)
-	if err != nil {
-		return err
-	}
-	if privateKey.N.Cmp(publicKey.N) != 0 || privateKey.E != publicKey.E {
-		return fmt.Errorf("%w: RSA private and public keys do not match", ErrInvalidKey)
-	}
-	if err := validateRSAKeySize(privateKey, signingMethod); err != nil {
-		return err
-	}
-	privateKey.Precompute()
-	if err := privateKey.Validate(); err != nil {
-		return fmt.Errorf("%w: validate RSA private key: %w", ErrInvalidKey, err)
-	}
-
-	j.privateKey = privateKey
-	j.publicKey = publicKey
-	return nil
-}
-
 func cloneRSAPublicKey(key *rsa.PublicKey) (*rsa.PublicKey, error) {
 	if key == nil {
 		return nil, fmt.Errorf("%w: RSA public key must not be nil", ErrInvalidKey)
@@ -314,9 +289,6 @@ func cloneRSAPublicKey(key *rsa.PublicKey) (*rsa.PublicKey, error) {
 }
 
 func cloneRSAPrivateKey(key *rsa.PrivateKey) (*rsa.PrivateKey, error) {
-	if key == nil {
-		return nil, fmt.Errorf("%w: RSA private key must not be nil", ErrInvalidKey)
-	}
 	if key.D == nil {
 		return nil, fmt.Errorf("%w: RSA private exponent must not be nil", ErrInvalidKey)
 	}
@@ -340,15 +312,4 @@ func cloneRSAPrivateKey(key *rsa.PrivateKey) (*rsa.PrivateKey, error) {
 		clone.Primes[i] = new(big.Int).Set(prime)
 	}
 	return clone, nil
-}
-
-func minRSAKeyBits(method jwtv5.SigningMethod) int {
-	switch method.Alg() {
-	case jwtv5.SigningMethodRS384.Alg(), jwtv5.SigningMethodPS384.Alg():
-		return 3072
-	case jwtv5.SigningMethodRS512.Alg(), jwtv5.SigningMethodPS512.Alg():
-		return 4096
-	default:
-		return 2048
-	}
 }
