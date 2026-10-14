@@ -34,6 +34,7 @@ type Tokener interface {
 	// ParseToken 解析并验证 JWT，返回解析后的 Claims。
 	ParseToken(tokenString string, opt ...jwtv5.ParserOption) (*claims.Claims, error)
 	// RefreshToken 在刷新窗口内刷新 JWT，返回新的 token 字符串。
+	// 每次调用独立续签，不自动消费或吊销旧 token；去重与一次性消费由调用方处理。
 	RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (string, error)
 	// CachedParseToken 允许缓存的 ParseToken；动态密钥实现可选择每次重新选键验签。
 	// 传入 ParserOption 时会退化为 ParseToken，以确保每次都应用当前校验条件。
@@ -51,6 +52,7 @@ type ContextParser interface {
 // ContextRefresher 额外提供带 context 取消能力的 token 刷新。
 type ContextRefresher interface {
 	// RefreshTokenContext 在刷新窗口内刷新 JWT，尊重 ctx 取消和 deadline。
+	// 每次调用独立续签；调用方负责刷新去重、一次性消费、幂等重试与多实例一致性。
 	RefreshTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (string, error)
 }
 
@@ -96,5 +98,6 @@ type Issuer interface {
 	// GenerateToken 根据用户 ID 和可选的 claims 选项生成 JWT。
 	GenerateToken(uid int64, options ...claims.Option) (string, error)
 	// RefreshToken 在刷新窗口内刷新 JWT，返回新的 token 字符串。
+	// 每次调用独立续签，不自动消费或吊销旧 token；去重与一次性消费由调用方处理。
 	RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (string, error)
 }

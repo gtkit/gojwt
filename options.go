@@ -189,6 +189,9 @@ func WithBlacklistCheckContextFunc(fn func(ctx context.Context, tokenID string) 
 
 // WithRevocationCheck 注入接收完整 claims 的吊销回调。
 //
+// 回调可能并发执行，必须并发安全；只检查状态，不应消费凭证或增加会话版本。
+// 一次性续签的消费与提交事务由调用方处理，此回调不保证检查到签发之间的原子性。
+//
 // 回调在签名与 claims 校验通过、黑名单检查之后执行，CachedParseToken 缓存命中时同样执行。
 // 回调接收 claims 副本，修改不会影响验签结果或缓存；调用后再次检查上下文取消。
 // 返回 true 表示该 token 已被吊销，解析返回 ErrTokenBlacklisted；返回 error 时鉴权 fail closed。

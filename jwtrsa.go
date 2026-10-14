@@ -124,12 +124,14 @@ func (j *JwtRSA) GenerateToken(uid int64, options ...claims.Option) (string, err
 // 仅当 token 距过期不足刷新窗口时允许刷新，否则返回 ErrRefreshTooEarly；
 // 会话已到 auth_time + refreshDuration 则返回 ErrRefreshExpired。
 // 刷新成功后会生成新的 TokenID/jti，并重置 iat、nbf，旧 token 与新 token 可独立吊销。
+// 同一旧 token 可被重复或并发续签，不自动去重、消费或吊销旧 token。
 // 只持公钥的实例返回 ErrNoSigningKey。
 func (j *JwtRSA) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (string, error) {
 	return j.RefreshTokenContext(context.Background(), tokenString, opt...)
 }
 
 // RefreshTokenContext 在刷新窗口内刷新 JWT token，并尊重 ctx 取消和 deadline。
+// 每次调用独立续签；调用方负责刷新去重、一次性消费、幂等重试与多实例一致性。
 func (j *JwtRSA) RefreshTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (string, error) {
 	if j == nil {
 		return "", ErrJWTNotInit

@@ -37,7 +37,7 @@ Go 生态中已经有了 `github.com/golang-jwt/jwt/v5` 这样优秀的底层 JW
 - ✅ 内置并发安全缓存 + 有界 worker pool 并发验签
 - ✅ 提供完整的 sentinel error 体系，业务层用 `errors.Is` 一行判断，错误链保留底层原因
 
-**简单说：gojwt 让你只关心「谁、什么角色、能不能过」，不关心「怎么签名、怎么对齐、怎么吊销」。**
+**gojwt 统一处理签名、字段对齐和吊销检查；应用负责权限规则、吊销状态存储与会话管理。**
 
 ## 特性
 
@@ -932,6 +932,9 @@ j, err := gojwt.NewJwtHmac(
 - 在签名与 claims 校验通过、黑名单检查之后执行；`CachedParseToken` 缓存命中时同样执行
 - 返回 `true` 时解析返回 `ErrTokenBlacklisted`；返回 error 时解析返回包装后的该 error
 - 可与黑名单 Option 同时配置：黑名单负责单个 token 的登出，回调负责用户级吊销
+- 回调可能并发执行，必须并发安全；外部查询使用传入的 ctx 并设置超时
+- 回调只检查状态，不消费凭证或更新会话版本；一次性续签需要调用方原子处理消费与提交
+- 按会话 ID 和版本吊销整条续签链的可运行示例见 `ExampleWithRevocationCheck_sessionVersion`
 
 ## HMAC 算法选择
 
@@ -1097,6 +1100,8 @@ func (j *JwtRSA) RefreshTokenContext(ctx context.Context, tokenString string, op
 - 新 token 保留旧 token 的有效时长，`exp` 不越过 `auth_time + refreshDuration`
 - 距过期仍超过刷新窗口返回 `ErrRefreshTooEarly`；会话已到终点返回 `ErrRefreshExpired`
 - 旧 token 与新 token 可独立吊销
+- 旧 token 必须先通过签名、时间字段、应用规则与吊销检查；超过解析 leeway 的过期 token 无法续签
+- 每次调用独立签发新 token；同一旧 token 可被重复或并发续签，不自动去重、消费或吊销旧 token
 - 只持公钥的验签实例返回 `ErrNoSigningKey`
 
 示例：
@@ -1117,6 +1122,77 @@ if err != nil {
 }
 _ = newToken
 ```
+
+### 续签并发与调用方职责
+
+`RefreshToken` / `RefreshTokenContext` 提供有界 JWT 续签。并发调用时，每次解析独立的 Claims，
+生成独立的 `TokenID/jti`；它们不保证同一旧 token 只成功续签一次，也不保证重复调用返回相同结果。
+这与使用独立 refresh token 的轮换、一次性消费和重放检测是不同的契约。
+
+例如旧 token `A` 已进入刷新窗口，两个请求都通过校验时：
+
+```text
+请求 1：RefreshToken(A) → B
+请求 2：RefreshToken(A) → C
+
+B、C 的 jti 不同，两者都可使用；A 仍按原有效期和吊销规则接受校验。
+吊销 A 不会连带吊销 B、C，整条续签链仍以原 auth_time + refreshDuration 为上界。
+```
+
+| 需求 | 调用方的处理 | gojwt 的职责与边界 |
+|---|---|---|
+| 页面同时发起多个临期请求 | 在客户端共享一次正在执行的刷新请求，成功后更新凭证并唤醒等待者 | 每次调用仍是独立续签 |
+| 单进程减少重复签发 | 在业务 service 中按同一凭证、会话和校验策略合并正在执行的调用 | 不内置刷新结果缓存或进程内去重 |
+| 同一刷新凭证只能使用一次 | 在认证 service 的共享存储中原子消费凭证，或按会话版本执行条件更新 | 吊销回调是状态检查，不是消费、提交事务或分布式锁 |
+| 超时、断连后重试 | 为刷新接口定义幂等键、结果保留期和重复请求策略 | 重试 `RefreshToken` 可能再次签发不同的 JWT |
+| 多实例一致性 | 所有相关签发、验签实例接入共享会话与吊销状态，明确缓存延迟及故障策略 | 内存黑名单只属于当前进程，重启后丢失 |
+| 退出整个会话 | 保存会话 ID 和版本或撤销状态，在所有验签入口通过 `WithRevocationCheck` 检查 | 只拉黑一枚 jti 无法撤销此前续签出的其他 token |
+
+客户端收到刷新结果时，应确认它仍对应当前登录会话和待替换的旧凭证，避免延迟响应覆盖后一次登录
+或更新后的凭证；退出登录时也要使仍在执行的刷新请求失去更新本地凭证的资格。
+
+单进程合并可使用应用已有的 [singleflight](https://pkg.go.dev/golang.org/x/sync/singleflight#Group.Do)：
+同一个 Group 中同 key 的重叠调用共享结果，调用完成后再次调用仍会重新执行，也不能协调多个进程。
+合并 key 必须包含影响授权与校验结果的会话、租户、凭证及策略维度；凭证可用摘要标识，不记录原始 JWT。
+等待者应能通过自己的 context 取消等待；共享操作使用明确的超时和授权上下文，避免首个请求取消
+使所有等待者一起失败。退出或权限变化后，任何保留的刷新结果都须重新确认会话状态。
+
+**先检查黑名单，续签成功后再拉黑旧 token，不能保证一次性消费：**
+
+```text
+请求 1：检查 A 未被吊销 ─→ 签发 B ─→ 吊销 A
+请求 2：检查 A 未被吊销 ─→ 签发 C ─→ 吊销 A
+```
+
+即使每次黑名单读写都是并发安全的，两个请求也能同时通过检查。仅增加本地 mutex、
+`WithRevocationCheck` 查询或临时分布式锁，也不等于获得持久的一次性消费记录。
+`WithRevocationCheck` 在普通解析、缓存命中和刷新时都可能执行，不应在回调中消费凭证或增加会话版本。
+回调必须并发安全，外部查询使用传入的 ctx 并设置超时，查询失败返回 error，鉴权会拒绝通过。
+
+需要一次性轮换时，应用的存储操作应遵循以下契约；这是流程说明，不是 gojwt 提供的存储 API：
+
+1. 校验凭证、会话、租户和权限，并确认幂等键绑定的是同一授权主体、旧凭证及请求参数。
+2. 准备新凭证；在事务或等价的原子条件更新中，复核会话仍有效及旧凭证尚未消费，
+   同时提交旧凭证的消费状态、新凭证状态，以及受保护且有保留期限的重试结果。
+   仅提交成功的结果可以返回给客户端。
+3. 重复请求通过身份和会话校验后，先用同一幂等键查询已提交的结果，不再次消费旧凭证或调用
+   `RefreshToken`；在规定窗口内，同一请求可取得同一有效结果，幂等键本身不能作为授权凭证。
+   提交结果未知时也先查询结果；退出或吊销后不重新发放已失效会话的结果。
+4. 原子条件不满足时，区分合法请求重试与旧凭证重放。若采用独立 refresh token 轮换，
+   再按应用策略处理关联会话的吊销与重新认证，见 [RFC 9700 §4.14.2](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2)。
+
+不要把 `WithRefreshDuration` 当作过期 token 的刷新宽限期：它限制整条续签链的最长时长。
+超出解析 leeway 后，旧 JWT 就不能用于续签；若需要 access token 过期后仍保持登录，
+应用需使用独立 refresh token 或其他重新认证凭证。
+
+可运行示例见 [example_test.go](example_test.go)：
+
+- `ExampleJwtHmac_RefreshTokenContext_concurrent`：两个并发请求获得不同 jti，旧 token 仍可校验。
+- `ExampleWithRevocationCheck_sessionVersion`：检查会话版本，版本变化后同时拒绝旧 token、续签出的 token 和后续刷新。
+
+第二个示例只演示单进程中的一个会话；多实例应用从共享存储读取各自会话的状态。
+会话版本检查提供吊销能力，不保证“检查到签发”之间的原子性，也不实现一次性轮换。
+四类签名实现的并发续签契约由 `TestRefreshTokenConcurrentContract` 验证。
 
 ### `ParallelVerify`
 
@@ -1449,6 +1525,7 @@ func Login(j gojwt.Issuer, uid int64) (string, error) {
 
 ```go
 // 刷新接口显式区分"未到刷新窗口""会话到期"和"token 失效"。
+// 每次调用独立续签；调用方需要的去重、一次性消费与幂等重试在 service 中处理。
 func Refresh(j gojwt.Issuer, oldToken string) (string, error) {
     newToken, err := j.RefreshToken(oldToken)
     if err != nil {
@@ -1463,6 +1540,8 @@ func Refresh(j gojwt.Issuer, oldToken string) (string, error) {
     return newToken, nil
 }
 ```
+
+此示例展示基础续签调用。并发控制、重试和多实例处理见[续签并发与调用方职责](#续签并发与调用方职责)。
 
 ### 登出接口示例
 
@@ -1670,6 +1749,8 @@ if err != nil {
 
 客户端在 token 临期时调用刷新接口，续到 `auth_time + refreshDuration` 为止；到达终点收到 `ErrRefreshExpired` 时引导重新登录。
 需要"随时可刷"时把 `WithRefreshWindow` 设为与 `WithTokenDuration` 相等。
+同一旧 token 的并发续签会产生独立的新 token；客户端共享正在执行的刷新请求，
+认证服务按业务需要处理一次性消费与幂等重试，详见[续签并发与调用方职责](#续签并发与调用方职责)。
 
 ### 5. 多实例黑名单落 Redis
 

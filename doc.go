@@ -42,6 +42,14 @@ gojwt 把这些「反复要做但又不是业务核心」的事情全部标准�
 - ParseBearerToken / ParseBearerRequest：提取 Bearer 凭据，拒绝非法字符与重复头部
 - Tokener / Verifier / Issuer：统一接口，面向接口编程可无缝切换算法
 
+# 续签与会话管理
+
+RefreshToken / RefreshTokenContext 每次调用独立签发新 JWT；同一旧 token 可以被重复或并发续签，
+旧 token 不会被自动消费或吊销。这些方法不提供刷新去重、幂等重试、独立 refresh token 轮换或重放检测。
+一次性消费、重试结果与多实例一致性由应用的认证 service 和共享存储管理。
+WithRevocationCheck 只检查吊销状态，不应在回调中消费凭证；回调可能并发执行，必须并发安全。
+通过会话 ID 和版本检查，可以同时吊销原 token 与已经续签出的 token。
+
 # 设计原则
 
 - 零外部基础设施依赖（不依赖 Redis、DB）

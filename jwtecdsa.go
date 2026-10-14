@@ -110,11 +110,13 @@ func (j *JwtECDSA) GenerateToken(uid int64, options ...claims.Option) (string, e
 }
 
 // RefreshToken 在刷新窗口与会话最长时限内刷新 JWT；仅公钥实例返回 ErrNoSigningKey。
+// 同一旧 token 可被重复或并发续签，不自动去重、消费或吊销旧 token。
 func (j *JwtECDSA) RefreshToken(tokenString string, opt ...jwtv5.ParserOption) (string, error) {
 	return j.RefreshTokenContext(context.Background(), tokenString, opt...)
 }
 
 // RefreshTokenContext 刷新 JWT，并尊重 ctx 取消和 deadline。
+// 每次调用独立续签；调用方负责刷新去重、一次性消费、幂等重试与多实例一致性。
 func (j *JwtECDSA) RefreshTokenContext(ctx context.Context, tokenString string, opt ...jwtv5.ParserOption) (string, error) {
 	if j == nil {
 		return "", ErrJWTNotInit
