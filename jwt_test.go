@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	jwtv5 "github.com/golang-jwt/jwt/v5"
@@ -489,20 +490,31 @@ func TestBlacklistConcurrentAccess(t *testing.T) {
 }
 
 func TestBlacklistAddTokenExpiresWithClaims(t *testing.T) {
-	blacklist := gojwt.NewBlacklist()
-
-	err := blacklist.AddToken(&claims.Claims{
-		TokenID: "exp-aware-token",
-		RegisteredClaims: jwtv5.RegisteredClaims{
-			ExpiresAt: jwtv5.NewNumericDate(time.Now().Add(1500 * time.Millisecond)),
-		},
-	})
-	require.NoError(t, err)
-	require.True(t, blacklist.In("exp-aware-token"))
-
-	require.Eventually(t, func() bool {
-		return !blacklist.In("exp-aware-token")
-	}, 3*time.Second, 20*time.Millisecond)
+	for _, tc := range []struct {
+		name  string
+		input time.Duration
+		want  time.Duration
+	}{
+		{name: "whole second", input: time.Second, want: 6 * time.Second},
+		{name: "subsecond", input: 500 * time.Millisecond, want: 5500 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				blacklist := gojwt.NewBlacklist()
+				err := blacklist.AddToken(&claims.Claims{
+					TokenID: "exp-aware-token",
+					RegisteredClaims: jwtv5.RegisteredClaims{
+						ExpiresAt: &jwtv5.NumericDate{Time: time.Now().Add(tc.input)},
+					},
+				})
+				require.NoError(t, err)
+				time.Sleep(tc.want - time.Nanosecond)
+				require.True(t, blacklist.In("exp-aware-token"))
+				time.Sleep(time.Nanosecond)
+				require.False(t, blacklist.In("exp-aware-token"))
+			})
+		})
+	}
 }
 
 func TestBlacklistAddWithExpirationExpires(t *testing.T) {

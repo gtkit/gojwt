@@ -13,6 +13,9 @@ import (
 // token 有效期短于它时窗口取整段有效期。
 const defaultRefreshWindow = 5 * time.Minute
 
+// defaultParseLeeway 同时用于默认验签容忍窗口与 AddToken 的吊销保留窗口。
+const defaultParseLeeway = 5 * time.Second
+
 // config 是 JwtHmac / JwtEd25519 / JwtRSA / JwtECDSA 的内部配置。
 type config struct {
 	tokenDuration    time.Duration
@@ -65,7 +68,8 @@ type Option func(*config)
 // Deprecated: 请直接使用 Option。
 type Options = Option
 
-// WithTokenDuration 设置 access token 的有效时长，默认 2 小时。
+// WithTokenDuration 设置 access token 的有效时长，默认 2 小时，必须大于零。
+// 使用 time.Hour 等带单位的 duration；直接传入整数的单位是纳秒。亚秒时长不会被截断到整秒。
 func WithTokenDuration(t time.Duration) Option {
 	return func(c *config) {
 		c.tokenDuration = t
@@ -97,6 +101,8 @@ func WithRefreshWindow(t time.Duration) Option {
 
 // WithParseLeeway 设置 JWT 解析时对 exp / nbf / iat 的容忍时间。
 // 默认 5 秒，用于吸收多机之间的轻微时钟漂移。
+// 使用非默认窗口或 ParserOption 覆盖时，吊销存储应同步保留至 exp 加所有验证方的最大窗口；
+// 内存黑名单可调用 AddTokenWithLeeway，零值表示严格按时间字段校验。
 func WithParseLeeway(t time.Duration) Option {
 	return func(c *config) {
 		c.parseLeeway = t
@@ -189,9 +195,6 @@ func WithBlacklistCheckContextFunc(fn func(ctx context.Context, tokenID string) 
 
 // WithRevocationCheck 注入接收完整 claims 的吊销回调。
 //
-// 回调可能并发执行，必须并发安全；只检查状态，不应消费凭证或增加会话版本。
-// 一次性续签的消费与提交事务由调用方处理，此回调不保证检查到签发之间的原子性。
-//
 // 回调在签名与 claims 校验通过、黑名单检查之后执行，CachedParseToken 缓存命中时同样执行。
 // 回调接收 claims 副本，修改不会影响验签结果或缓存；调用后再次检查上下文取消。
 // 返回 true 表示该 token 已被吊销，解析返回 ErrTokenBlacklisted；返回 error 时鉴权 fail closed。
@@ -202,7 +205,9 @@ func WithBlacklistCheckContextFunc(fn func(ctx context.Context, tokenID string) 
 //	    if err != nil {
 //	        return false, err
 //	    }
-//	    return c.IssuedAt != nil && c.IssuedAt.Time.Before(cutoff), nil
+//	    origin := c.AuthTime
+//	    if origin == nil { origin = c.IssuedAt } // 兼容旧 token
+//	    return origin == nil || origin.Time.Before(cutoff), nil
 //	})
 func WithRevocationCheck(fn func(ctx context.Context, tokenClaims *claims.Claims) (bool, error)) Option {
 	return func(c *config) {
@@ -254,7 +259,7 @@ func defaultConfig() config {
 	return config{
 		tokenDuration:   2 * time.Hour,
 		refreshDuration: 7 * 24 * time.Hour,
-		parseLeeway:     5 * time.Second,
+		parseLeeway:     defaultParseLeeway,
 		cacheMaxEntries: 4096,
 	}
 }

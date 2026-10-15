@@ -157,7 +157,7 @@ Go 最低补丁版本为 1.26.9。升级时须核对以下安全校验变化：
 ## 安装
 
 ```bash
-go get github.com/gtkit/gojwt@v1.1.0
+go get github.com/gtkit/gojwt@v1.2.0
 ```
 
 ## 适用场景
@@ -255,6 +255,23 @@ type Claims struct {
 
 可以通过构造时的 Option 修改。构造函数会校验 `refreshDuration >= tokenDuration` 与
 `0 < refreshWindow <= tokenDuration`，不满足时返回 `ErrInvalidConfig` 并在错误信息中指出该改哪个 Option。
+
+### 时间精度与有效期排查
+
+首次签发的 `exp` 为签发时刻加 `WithTokenDuration`，签发时的 `claims.WithExpiresIn` /
+`claims.WithExpiresAtTime` 可以覆盖它。签发、解析、缓存拷贝和续签保留纳秒精度，
+500 毫秒这样的正有效期不会因整秒截断而提前失效；执行签名、传输和校验本身消耗的时间仍计入有效期。
+
+- duration 必须写明单位：`time.Hour` 或 `3600*time.Second` 是 1 小时，`WithTokenDuration(3600)` 是 3600 纳秒。
+- 时间字段保持 JSON NumericDate 数字，可包含小数秒；旧整数时间继续支持，包不修改 `jwt/v5.TimePrecision`。
+- 外部验证方使用亚秒 token 时须保留相同的时间精度；直接 `json.Unmarshal` 到 Claims 的日期精度仍由 jwt/v5 控制，精确 JWT 校验使用本包解析入口。
+- 零 leeway 在 `now >= exp` 时拒绝；正 leeway 在 `now >= exp + leeway` 时拒绝。`Claims.TTL()` 只计算至 exp，不包含 leeway，也不能证明 token 未被吊销。
+- `exp` 保持有效不代表鉴权一定成功；吊销、验签密钥失效或外部状态查询失败也会拒绝请求。
+  用 `errors.Is(err, gojwt.ErrTokenExpired)` 区分真正过期，避免把所有鉴权错误显示成“过期”。
+- 多实例应同步服务端时钟；排查时记录 `iat/exp/auth_time`、校验时的服务端时间及错误类别，不记录完整 JWT 或密钥。
+
+可运行的精确边界示例见 `ExampleJwtHmac_GenerateToken_expiration`，验证 exp 前一纳秒有效、exp 瞬间过期。
+该示例的 `WithTimeFunc` 只用于演示；生产时钟不得从未验证的 token 或客户端参数反推。
 
 ### Refresh 规则
 
@@ -732,6 +749,8 @@ _ = j
 - 默认值为 `5 秒`
 - 会同时作用于 `exp`、`nbf`、`iat`；解析默认要求 `exp` 存在并校验 `iat` 不晚于当前时刻加 leeway
 - 如果你希望严格按时间字段校验，可显式传 `gojwt.WithParseLeeway(0)`
+- leeway 必须非负。吊销记录应保留至 exp 加所有验证方允许的最大 leeway，并按需加入时钟差余量；
+  `AddToken` 默认使用 5 秒，自定义或单次 ParserOption 覆盖时使用 `AddTokenWithLeeway`，外部存储采用同样规则
 
 ### `WithParserOptions`
 
@@ -922,7 +941,11 @@ j, err := gojwt.NewJwtHmac(
         if err != nil {
             return false, err // 存储不可用时 fail closed
         }
-        return c.IssuedAt != nil && c.IssuedAt.Time.Before(cutoff), nil
+        origin := c.AuthTime
+        if origin == nil {
+            origin = c.IssuedAt // 兼容尚未携带 auth_time 的旧 token
+        }
+        return origin == nil || origin.Time.Before(cutoff), nil
     }),
 )
 ```
@@ -935,6 +958,11 @@ j, err := gojwt.NewJwtHmac(
 - 回调可能并发执行，必须并发安全；外部查询使用传入的 ctx 并设置超时
 - 回调只检查状态，不消费凭证或更新会话版本；一次性续签需要调用方原子处理消费与提交
 - 按会话 ID 和版本吊销整条续签链的可运行示例见 `ExampleWithRevocationCheck_sessionVersion`
+
+`iat` 在续签时会更新，因此改密截止时间应比较稳定的 `auth_time`；缺失它时才回落到旧 token 的 `iat`，
+两者都缺失则拒绝。查询与签发之间若发生改密，续签调用仍可能完成，但新 token 的原始 auth_time
+会使其后续鉴权被拒绝。可执行交错示例见 `ExampleWithRevocationCheck_passwordChange`。
+时间截止方案要求可信且精度匹配的时间源；生产应用可优先使用会话版本避免时钟与时间戳精度差异。
 
 ## HMAC 算法选择
 
@@ -1344,6 +1372,17 @@ type BlacklistManager interface {
 }
 ```
 
+`BlacklistManager` 方法集保持兼容；具体的 `*Blacklist` 另提供：
+
+```go
+func (b *Blacklist) AddTokenWithLeeway(tokenClaims *claims.Claims, leeway time.Duration) error
+```
+
+`AddToken` 保留至 `exp + 5 秒`，覆盖默认验签容忍窗口。`AddTokenWithLeeway` 的窗口必须非负，
+零值仅保留至 exp；负值返回 `ErrInvalidConfig`，缺失 claims、token_id 或 exp 返回 `ErrTokenInvalidClaims`。
+窗口由调用方提供，方法不会读取 JWT 实例、单次 ParserOption 或其他验证方配置。
+可运行示例见 `ExampleBlacklist_AddTokenWithLeeway`。
+
 工厂函数：
 
 - `NewBlacklist() *Blacklist`
@@ -1362,13 +1401,13 @@ if err != nil {
 // 服务退出时关闭后台协程，避免 goroutine 泄漏。
 defer blacklist.Close()
 
-// ========== 推荐用法：按 token 自身 exp 自动失效 ==========
+// ========== 默认用法：覆盖 token 的默认验签接受窗口 ==========
 // AddToken 会自动读取 Claims 中的 TokenID 和 ExpiresAt，
-// token 过期后黑名单条目自动失效，不需要手动删除。
+// 保留到 exp 加默认 5 秒，窗口结束后条目自动失效。
 err = blacklist.AddToken(&claims.Claims{
     TokenID: "token-id-1",
     RegisteredClaims: jwtv5.RegisteredClaims{
-        ExpiresAt: jwtv5.NewNumericDate(time.Now().Add(2 * time.Hour)),
+        ExpiresAt: &jwtv5.NumericDate{Time: time.Now().Add(2 * time.Hour)},
     },
 })
 if err != nil {
@@ -1394,7 +1433,8 @@ blacklist.Remove("token-id-1")
 注意：
 
 - 当前是纯内存实现，适用于单实例部署
-- `AddToken` / `AddWithExpiration` 写入的条目会在到达过期时间后惰性失效
+- `AddToken` 默认在 exp 加 5 秒后惰性失效；`AddTokenWithLeeway` 在指定窗口结束后失效
+- `AddWithExpiration` 保持按传入的绝对时刻失效；调用方应自行把 leeway 与时钟差余量计入该时刻
 - 如果使用 `NewBlacklistWithCleanup`，后台会按固定间隔主动清理过期条目
 - `Close()` 应在服务退出时调用，用于停止后台清理协程
 - `Add(tokenID)` 是兼容旧代码的永久拉黑接口
@@ -1546,7 +1586,7 @@ func Refresh(j gojwt.Issuer, oldToken string) (string, error) {
 ### 登出接口示例
 
 ```go
-// 登出时优先按 token 自身 exp 加入黑名单。
+// 默认 5 秒验签容忍窗口：登出记录保留至 token 自身 exp 加 5 秒。
 func Logout(blacklist *gojwt.Blacklist, tokenClaims *claims.Claims) error {
     if blacklist == nil || tokenClaims == nil {
         return nil
@@ -1555,10 +1595,16 @@ func Logout(blacklist *gojwt.Blacklist, tokenClaims *claims.Claims) error {
 }
 ```
 
+自定义 leeway 的应用调用 `AddTokenWithLeeway(tokenClaims, maximumLeeway)`；共享存储的 TTL
+也须覆盖该接受窗口。只按 exp 删除记录会让已吊销 token 在容忍窗口内重新通过验签和续签。
+
 ### 改密踢下线示例
 
+应用 service 应在同一事务中更新密码和改密截止时间/会话版本；以下 `store` 必须是该事务绑定的存储，
+调用方根据函数结果提交或回滚。验证回调按上文的稳定认证起点判断，不比较续签后的新 iat。
+
 ```go
-// 改密时记录时刻；WithRevocationCheck 回调据此把该用户改密前签发的全部 token 判为已吊销。
+// 改密截止时间与密码更新在同一应用事务提交；认证会话早于截止时间的 token 作废。
 func ChangePassword(ctx context.Context, store Store, uid int64, newPassword string) error {
     if err := store.UpdatePassword(ctx, uid, newPassword); err != nil {
         return err
@@ -1780,7 +1826,8 @@ if err != nil {
 
 ### 为什么内存黑名单还保留 `Add(tokenID string)`
 
-这是为了兼容已有调用方。新代码优先使用 `AddToken` 或 `AddWithExpiration`，这样条目会随 token 生命周期自动失效。
+这是为了兼容已有调用方。默认验证窗口优先使用 `AddToken`；自定义窗口使用 `AddTokenWithLeeway`。
+`AddWithExpiration` 可直接写入已经计入 leeway 的绝对失效时刻，条目在完整接受窗口结束后自动失效。
 
 ### 为什么还需要 `NewBlacklistWithCleanup`
 

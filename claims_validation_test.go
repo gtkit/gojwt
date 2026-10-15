@@ -168,11 +168,13 @@ func TestClaimsValidatorIsolationAndCache(t *testing.T) {
 				return nil
 			}))
 			require.NoError(t, err)
+			var originalExpiry, originalAuthTime time.Time
 			token, err := j.GenerateToken(42, claims.WithRole("user"), claims.WithAudience("api"),
-				claims.WithExt("nested", map[string]any{"values": []any{"original"}}))
-			require.NoError(t, err)
-			original := &claims.Claims{}
-			_, _, err = jwtv5.NewParser().ParseUnverified(token, original)
+				claims.WithExt("nested", map[string]any{"values": []any{"original"}}),
+				func(c *claims.Claims) {
+					originalExpiry = c.ExpiresAt.Time
+					originalAuthTime = c.AuthTime.Time
+				})
 			require.NoError(t, err)
 			parse := j.ParseTokenContext
 			if tt.cached {
@@ -184,8 +186,8 @@ func TestClaimsValidatorIsolationAndCache(t *testing.T) {
 				require.Equal(t, int64(42), got.UserID)
 				require.Equal(t, []string{"user"}, got.Roles)
 				require.Equal(t, jwtv5.ClaimStrings{"api"}, got.Audience)
-				require.True(t, got.ExpiresAt.Equal(original.ExpiresAt.Time))
-				require.True(t, got.AuthTime.Equal(original.AuthTime.Time))
+				require.True(t, got.ExpiresAt.Equal(originalExpiry))
+				require.True(t, got.AuthTime.Equal(originalAuthTime))
 				require.Equal(t, "original", got.Ext["nested"].(map[string]any)["values"].([]any)[0])
 			}
 			reject.Store(true)

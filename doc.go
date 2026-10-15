@@ -49,6 +49,15 @@ RefreshToken / RefreshTokenContext 每次调用独立签发新 JWT；同一旧 t
 一次性消费、重试结果与多实例一致性由应用的认证 service 和共享存储管理。
 WithRevocationCheck 只检查吊销状态，不应在回调中消费凭证；回调可能并发执行，必须并发安全。
 通过会话 ID 和版本检查，可以同时吊销原 token 与已经续签出的 token。
+按改密时间吊销时比较 AuthTime；旧 token 没有 AuthTime 时回落到 IssuedAt，两者都缺失时拒绝。
+AddToken 保留吊销记录至 exp 加默认 5 秒；其他验签窗口使用 AddTokenWithLeeway 或等价的外部存储规则。
+
+# 时间精度
+
+签发、解析、缓存拷贝和续签保留时间字段的纳秒精度，JSON NumericDate 可以含小数秒。
+现有整数时间字段继续接受，不修改 jwt/v5 的全局 TimePrecision；外部验证方使用亚秒 token 时须支持相同精度。
+直接 json.Unmarshal 到 Claims 的日期精度仍由 jwt/v5 控制，JWT 验签与精确时间应使用本包解析入口。
+WithTokenDuration 的单位为 time.Duration，直接整数表示纳秒；claims 过期时间选项会覆盖实例有效期。
 
 # 设计原则
 

@@ -149,10 +149,10 @@ func refreshTokenClaims(tokenClaims *claims.Claims, cfg *config) error {
 
 	tokenClaims.TokenID = newTokenID
 	tokenClaims.ID = newTokenID
-	tokenClaims.AuthTime = jwtv5.NewNumericDate(authTime)
-	tokenClaims.ExpiresAt = jwtv5.NewNumericDate(expiresAt)
-	tokenClaims.IssuedAt = jwtv5.NewNumericDate(now)
-	tokenClaims.NotBefore = jwtv5.NewNumericDate(now)
+	tokenClaims.AuthTime = &jwtv5.NumericDate{Time: authTime}
+	tokenClaims.ExpiresAt = &jwtv5.NumericDate{Time: expiresAt}
+	tokenClaims.IssuedAt = &jwtv5.NumericDate{Time: now}
+	tokenClaims.NotBefore = &jwtv5.NumericDate{Time: now}
 	return nil
 }
 
@@ -306,7 +306,8 @@ func cloneNumericDate(src *jwtv5.NumericDate) *jwtv5.NumericDate {
 	if src == nil {
 		return nil
 	}
-	return jwtv5.NewNumericDate(src.Time)
+	copyDate := *src
+	return &copyDate
 }
 
 // cloneExtMap 递归拷贝扩展字段。JSON 解码只会产出 map[string]any 与 []any 两种容器，
@@ -436,11 +437,11 @@ func generateTokenImpl(cfg *config, uid int64, options []claims.Option, signFn f
 	tokenClaims := &claims.Claims{
 		UserID:   uid,
 		TokenID:  tokenID,
-		AuthTime: jwtv5.NewNumericDate(now),
+		AuthTime: &jwtv5.NumericDate{Time: now},
 		RegisteredClaims: jwtv5.RegisteredClaims{
-			ExpiresAt: jwtv5.NewNumericDate(now.Add(cfg.tokenDuration)),
-			NotBefore: jwtv5.NewNumericDate(now),
-			IssuedAt:  jwtv5.NewNumericDate(now),
+			ExpiresAt: &jwtv5.NumericDate{Time: now.Add(cfg.tokenDuration)},
+			NotBefore: &jwtv5.NumericDate{Time: now},
+			IssuedAt:  &jwtv5.NumericDate{Time: now},
 			ID:        tokenID,
 		},
 	}

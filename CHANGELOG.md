@@ -5,6 +5,31 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.2.0] - 2026-10-15
+
+保持 `github.com/gtkit/gojwt` 模块路径、现有公开签名与接口方法集；升级命令：
+`go get github.com/gtkit/gojwt@v1.2.0`。
+
+### Added
+
+- `(*Blacklist).AddTokenWithLeeway`：按调用方指定的非负容忍窗口保留吊销记录；现有接口和构造函数签名不变。
+- 可执行的亚秒过期边界、显式吊销保留窗口、改密与续签并发交错示例，以及四类签名实现的确定性边界测试。
+- 并发续签与会话版本吊销示例，明确调用方负责刷新去重、一次性消费、重试结果及多实例一致性。
+
+### Fixed
+
+- 签发、claims 过期选项、JSON NumericDate、解析、缓存副本和续签保留纳秒精度，修复短 token 被整秒截断后提前失效；不修改 jwt/v5 全局时间精度。时间字段仍为 JSON 数字，可包含小数秒；旧整数时间继续支持。
+
+### Security
+
+- `AddToken` 默认保留至 `exp + 5 秒`，覆盖默认验签容忍窗口，避免已吊销 token 在声明的 exp 后重新通过校验和续签。
+- 改密吊销示例优先比较稳定的 `auth_time`，旧 token 回落到 `iat`，缺失两者时拒绝，避免续签重置 `iat` 绕过改密截止时间。
+
+### Changed
+
+- 非默认或按请求覆盖的 leeway 须用 `AddTokenWithLeeway` 或外部存储同步完整的接受窗口，并按需加入时钟差余量；零 leeway 使用显式方法传零。
+- 外部 JWT 验证方使用亚秒 token 时需保留小数秒；直接 `json.Unmarshal` 的日期精度仍遵循 jwt/v5，精确 JWT 校验通过 gojwt 的解析方法进行。
+
 ## [v1.1.0] - 2026-10-12
 
 > ⚠ 安全校验收紧：以下旧行为改为返回错误，升级前须核对调用方配置与外部 token：

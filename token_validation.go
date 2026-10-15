@@ -8,7 +8,9 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	jwtv5 "github.com/golang-jwt/jwt/v5"
@@ -154,7 +156,8 @@ func (c *strictTokenClaims) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("%s must be a JSON number: %w", name, err)
 		}
 		seconds, err := number.Float64()
-		if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds >= maxNumericDate || seconds < minNumericDate {
+		// 精确范围在恢复纳秒日期后检查；Float64 可能把年 9999 的最后一纳秒舍入至上界。
+		if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds > maxNumericDate || seconds < minNumericDate {
 			return fmt.Errorf("%s is outside the supported NumericDate range", name)
 		}
 	}
@@ -190,6 +193,27 @@ func (c *strictTokenClaims) UnmarshalJSON(data []byte) error {
 	if err := decoder.Decode(c.Claims); err != nil {
 		return err
 	}
+	// 上游 NumericDate.UnmarshalJSON 会按全局 TimePrecision 截断，
+	// 用已经检查过类型的原始日期恢复精度，不改变 Ext 的 UseNumber 规则。
+	for _, field := range []struct {
+		name string
+		date **jwtv5.NumericDate
+	}{
+		{name: "exp", date: &c.ExpiresAt},
+		{name: "nbf", date: &c.NotBefore},
+		{name: "iat", date: &c.IssuedAt},
+		{name: "auth_time", date: &c.AuthTime},
+	} {
+		raw, exists := fields[field.name]
+		if !exists || bytes.Equal(raw, []byte("null")) {
+			continue
+		}
+		date, err := parsePreciseNumericDate(raw)
+		if err != nil {
+			return fmt.Errorf("%s: %w", field.name, err)
+		}
+		*field.date = date
+	}
 	for name, raw := range fields {
 		if claims.IsReservedName(name) {
 			continue
@@ -206,6 +230,82 @@ func (c *strictTokenClaims) UnmarshalJSON(data []byte) error {
 		c.Custom[name] = value
 	}
 	return nil
+}
+
+// parsePreciseNumericDate 转换十进制 NumericDate，精度为纳秒；更细的小数向零截断。
+// 指数先限定其对小数点的影响，避免极端指数触发整数溢出或巨量补零分配。
+func parsePreciseNumericDate(raw json.RawMessage) (*jwtv5.NumericDate, error) {
+	var number json.Number
+	if len(raw) == 0 || raw[0] == '"' || json.Unmarshal(raw, &number) != nil {
+		return nil, fmt.Errorf("%w: NumericDate must be a number", ErrTokenMalformed)
+	}
+	value := number.String()
+	if value == "" {
+		return nil, fmt.Errorf("%w: NumericDate must be a number", ErrTokenMalformed)
+	}
+	negative := strings.HasPrefix(value, "-")
+	value = strings.TrimPrefix(value, "-")
+	mantissa, exponentText := value, "0"
+	if index := strings.IndexAny(value, "eE"); index >= 0 {
+		mantissa, exponentText = value[:index], value[index+1:]
+	}
+	point := len(mantissa)
+	if index := strings.IndexByte(mantissa, '.'); index >= 0 {
+		point = index
+	}
+	digits := strings.ReplaceAll(mantissa, ".", "")
+	trimmed := strings.TrimLeft(digits, "0")
+	point -= len(digits) - len(trimmed)
+	digits = trimmed
+	if digits == "" {
+		return &jwtv5.NumericDate{Time: time.Unix(0, 0).UTC()}, nil
+	}
+	exponent, err := strconv.ParseInt(exponentText, 10, 64)
+	if err != nil {
+		if strings.HasPrefix(exponentText, "-") {
+			return &jwtv5.NumericDate{Time: time.Unix(0, 0).UTC()}, nil
+		}
+		return nil, fmt.Errorf("%w: NumericDate exponent is outside the supported range", ErrTokenMalformed)
+	}
+	if exponent > 19-int64(point) {
+		return nil, fmt.Errorf("%w: NumericDate is outside the supported range", ErrTokenMalformed)
+	}
+	if exponent < -9-int64(point) {
+		return &jwtv5.NumericDate{Time: time.Unix(0, 0).UTC()}, nil
+	}
+	point += int(exponent)
+	whole, fraction := "0", ""
+	if point > 0 {
+		whole = digits[:min(point, len(digits))]
+		if point > len(digits) {
+			whole += strings.Repeat("0", point-len(digits))
+		} else {
+			fraction = digits[point:]
+		}
+	} else {
+		fraction = strings.Repeat("0", -point) + digits[:min(9, len(digits))]
+	}
+	fraction = fraction[:min(9, len(fraction))]
+	fraction += strings.Repeat("0", 9-len(fraction))
+	if negative {
+		whole = "-" + whole
+	}
+	seconds, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("%w: NumericDate seconds: %w", ErrTokenMalformed, err)
+	}
+	nanos, err := strconv.ParseInt(fraction, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("%w: NumericDate fraction: %w", ErrTokenMalformed, err)
+	}
+	if negative {
+		nanos = -nanos
+	}
+	date := time.Unix(seconds, nanos).UTC()
+	if date.Year() < 1 || date.Year() > 9999 {
+		return nil, fmt.Errorf("%w: NumericDate is outside the supported range", ErrTokenMalformed)
+	}
+	return &jwtv5.NumericDate{Time: date}, nil
 }
 
 // finalizeTokenIdentifiers 只在签名与标准校验成功后归一化撤销标识。

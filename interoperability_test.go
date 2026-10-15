@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -28,9 +29,7 @@ func interoperableKey(t *testing.T) []byte {
 func externalToken(t *testing.T, key []byte, payload jwtv5.MapClaims, header map[string]any) string {
 	t.Helper()
 	token := jwtv5.NewWithClaims(jwtv5.SigningMethodHS256, payload)
-	for name, value := range header {
-		token.Header[name] = value
-	}
+	maps.Copy(token.Header, header)
 	raw, err := token.SignedString(key)
 	if err != nil {
 		t.Fatal(err)

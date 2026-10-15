@@ -268,3 +268,148 @@ func ExampleWithRevocationCheck_sessionVersion() {
 	// new token revoked: true
 	// refresh rejected: true
 }
+
+func ExampleBlacklist_AddTokenWithLeeway() {
+	secret, err := gojwt.GenerateHMACKeyString(jwtv5.SigningMethodHS256)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	blacklist := gojwt.NewBlacklist()
+	const maximumLeeway = 30 * time.Second // 应用配置：覆盖所有验证方允许的最大容忍时间。
+	j, err := gojwt.NewJwtHmac([]byte(secret), gojwt.WithParseLeeway(maximumLeeway), gojwt.WithBlacklistFunc(blacklist.In))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	token, err := j.GenerateToken(42)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	c, err := j.CachedParseToken(token)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	// 默认 AddToken 使用 5 秒；应用使用 30 秒 leeway 时显式同步吊销保留时间。
+	if err := blacklist.AddTokenWithLeeway(c, maximumLeeway); err != nil {
+		fmt.Println(err)
+		return
+	}
+	_, parseErr := j.CachedParseToken(token)
+	_, refreshErr := j.RefreshToken(token)
+	fmt.Println("cached token revoked:", errors.Is(parseErr, gojwt.ErrTokenBlacklisted))
+	fmt.Println("refresh rejected:", errors.Is(refreshErr, gojwt.ErrTokenBlacklisted))
+	// Output:
+	// cached token revoked: true
+	// refresh rejected: true
+}
+
+func ExampleJwtHmac_GenerateToken_expiration() {
+	secret, err := gojwt.GenerateHMACKeyString(jwtv5.SigningMethodHS256)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	j, err := gojwt.NewJwtHmac([]byte(secret), gojwt.WithTokenDuration(500*time.Millisecond), gojwt.WithParseLeeway(0))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	var issuedAt time.Time
+	token, err := j.GenerateToken(42, func(c *claims.Claims) { issuedAt = c.IssuedAt.Time })
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	// 固定校验时钟只用于这个边界演示；生产鉴权使用可信的真实服务端时钟。
+	c, err := j.ParseToken(token, jwtv5.WithTimeFunc(func() time.Time { return issuedAt }))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	_, beforeErr := j.ParseToken(token, jwtv5.WithTimeFunc(func() time.Time { return c.ExpiresAt.Add(-time.Nanosecond) }))
+	_, atErr := j.ParseToken(token, jwtv5.WithTimeFunc(func() time.Time { return c.ExpiresAt.Time }))
+	fmt.Println("lifetime:", c.ExpiresAt.Sub(c.IssuedAt.Time))
+	fmt.Println("valid before exp:", beforeErr == nil)
+	fmt.Println("expired at exp:", errors.Is(atErr, gojwt.ErrTokenExpired))
+	// Output:
+	// lifetime: 500ms
+	// valid before exp: true
+	// expired at exp: true
+}
+
+// 示例应用的策略；实际截止时间从应用存储读取，按用户和租户隔离。
+func examplePasswordChangeRevoked(c *claims.Claims, cutoff time.Time) bool {
+	origin := c.AuthTime
+	if origin == nil {
+		origin = c.IssuedAt // 兼容尚未携带 auth_time 的旧 token。
+	}
+	return origin == nil || origin.Before(cutoff)
+}
+
+func ExampleWithRevocationCheck_passwordChange() {
+	secret, err := gojwt.GenerateHMACKeyString(jwtv5.SigningMethodHS256)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	var cutoff atomic.Int64
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var pause atomic.Bool
+	j, err := gojwt.NewJwtHmac([]byte(secret), gojwt.WithTokenDuration(30*time.Minute),
+		gojwt.WithRefreshWindow(30*time.Minute),
+		gojwt.WithRevocationCheck(func(ctx context.Context, c *claims.Claims) (bool, error) {
+			// 模拟外部查询读到了改密前的截止时间。
+			snapshot := cutoff.Load()
+			if pause.CompareAndSwap(true, false) {
+				close(entered)
+				select {
+				case <-resume:
+				case <-ctx.Done():
+					return false, ctx.Err()
+				}
+			}
+			return examplePasswordChangeRevoked(c, time.Unix(0, snapshot)), nil
+		}))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	oldToken, err := j.GenerateToken(42)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pause.Store(true)
+	var newToken string
+	var refreshErr error
+	var wg sync.WaitGroup
+	wg.Go(func() { newToken, refreshErr = j.RefreshTokenContext(ctx, oldToken) })
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		wg.Wait()
+		fmt.Println(ctx.Err())
+		return
+	}
+	// 改密在查询与签发之间发生；会话版本/时间戳更新应与密码更新在应用事务中提交。
+	cutoff.Store(time.Now().UnixNano())
+	close(resume)
+	wg.Wait()
+	if refreshErr != nil {
+		fmt.Println(refreshErr)
+		return
+	}
+	// 新 iat 不会改变旧 auth_time，两个 token 的后续鉴权都被拒绝。
+	_, oldErr := j.ParseTokenContext(ctx, oldToken)
+	_, newErr := j.ParseTokenContext(ctx, newToken)
+	fmt.Println("old session revoked:", errors.Is(oldErr, gojwt.ErrTokenBlacklisted))
+	fmt.Println("concurrent renewal revoked:", errors.Is(newErr, gojwt.ErrTokenBlacklisted))
+	// Output:
+	// old session revoked: true
+	// concurrent renewal revoked: true
+}

@@ -85,9 +85,10 @@ func WithAudience(audience ...string) Option {
 }
 
 // WithExpiresIn 设置过期时间（从当前时刻起加上指定时长）。
+// 此选项覆盖实例有效期；保留亚秒精度，不依赖 jwt/v5 的全局 TimePrecision。
 func WithExpiresIn(d time.Duration) Option {
 	return func(claims *Claims) {
-		claims.ExpiresAt = jwtv5.NewNumericDate(time.Now().Add(d))
+		claims.ExpiresAt = &jwtv5.NumericDate{Time: time.Now().Add(d)}
 	}
 }
 
@@ -100,9 +101,10 @@ func WithExpiresAt(d time.Duration) Option {
 }
 
 // WithExpiresAtTime 设置绝对过期时间。
+// 此选项覆盖实例有效期，并保留调用方指定时刻的亚秒精度。
 func WithExpiresAtTime(t time.Time) Option {
 	return func(claims *Claims) {
-		claims.ExpiresAt = jwtv5.NewNumericDate(t)
+		claims.ExpiresAt = &jwtv5.NumericDate{Time: t}
 	}
 }
 

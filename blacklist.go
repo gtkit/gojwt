@@ -25,7 +25,7 @@ type BlacklistManager interface {
 	Blacklister
 	// AddWithExpiration 将 tokenID 加入黑名单，expiresAt 后自动失效。
 	AddWithExpiration(tokenID string, expiresAt time.Time)
-	// AddToken 从 claims 中读取 token_id 和 exp，并加入黑名单。
+	// AddToken 从 claims 中读取 token_id 和 exp，保留至 exp 加默认 5 秒验签容忍窗口。
 	AddToken(tokenClaims *claims.Claims) error
 	// SweepExpired 主动清理已过期的黑名单条目，返回删除数量。
 	SweepExpired() int
@@ -124,8 +124,21 @@ func (b *Blacklist) AddWithExpiration(tokenID string, expiresAt time.Time) {
 	b.m[tokenID] = expiresAt
 }
 
-// AddToken 从 claims 中读取 token_id 和 exp，并加入黑名单。
+// AddToken 从 claims 中读取 token_id 和 exp，保留至 exp 加默认 5 秒验签容忍窗口。
+// 验证方使用其他 leeway 或需要时钟差余量时，使用 AddTokenWithLeeway 指定完整保留窗口。
 func (b *Blacklist) AddToken(tokenClaims *claims.Claims) error {
+	return b.AddTokenWithLeeway(tokenClaims, defaultParseLeeway)
+}
+
+// AddTokenWithLeeway 按 token_id 吊销 token，保留至 exp 加 leeway。
+// leeway 必须非负；零值表示仅保留至 exp。调用方应传入所有验证方允许的最大 leeway，
+// 并按需加入时钟差余量；这里不会读取 JWT 实例或单次 ParserOption 的配置。
+// 无效 leeway 返回 ErrInvalidConfig；缺失 claims、token_id 或 exp 返回 ErrTokenInvalidClaims。
+// 此方法可并发使用，不增加 BlacklistManager 的方法要求。
+func (b *Blacklist) AddTokenWithLeeway(tokenClaims *claims.Claims, leeway time.Duration) error {
+	if leeway < 0 {
+		return fmt.Errorf("%w: blacklist leeway must not be negative", ErrInvalidConfig)
+	}
 	if tokenClaims == nil {
 		return fmt.Errorf("%w: claims is required", ErrTokenInvalidClaims)
 	}
@@ -136,7 +149,7 @@ func (b *Blacklist) AddToken(tokenClaims *claims.Claims) error {
 		return fmt.Errorf("%w: expires_at is required", ErrTokenInvalidClaims)
 	}
 
-	b.AddWithExpiration(tokenClaims.TokenID, tokenClaims.ExpiresAt.Time)
+	b.AddWithExpiration(tokenClaims.TokenID, tokenClaims.ExpiresAt.Add(leeway))
 	return nil
 }
 
