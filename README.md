@@ -157,7 +157,7 @@ Go 最低补丁版本为 1.26.9。升级时须核对以下安全校验变化：
 ## 安装
 
 ```bash
-go get github.com/gtkit/gojwt@v1.2.0
+go get github.com/gtkit/gojwt@v1.3.0
 ```
 
 ## 适用场景
@@ -547,6 +547,17 @@ verifier, err := gojwt.NewJwtRSAVerifier(&privateKey.PublicKey)
 ```
 
 ## 构造函数
+
+### APISIX 应用标识
+
+接入 APISIX 默认 `jwt-auth` 时，可通过 `WithApplicationKey` 将应用标识写入 JWT 载荷的顶层 `key`。
+APISIX Consumer Credential 的 `key` 应使用相同的值。省略此选项时照常签发 JWT。
+续签沿用原 token 的 `key`，原 token 缺少该字段时也保持缺省。
+显式传入空字符串或全空白值会返回 `ErrInvalidConfig`。
+
+```go
+issuer, err := gojwt.NewJwtHmac(secret, gojwt.WithApplicationKey("orders-api"))
+```
 
 ### `NewJwtHmac`
 

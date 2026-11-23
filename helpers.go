@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"runtime"
 	"slices"
 	"strings"
@@ -451,6 +452,12 @@ func generateTokenImpl(cfg *config, uid int64, options []claims.Option, signFn f
 			continue
 		}
 		opt(tokenClaims)
+	}
+	if cfg.applicationKey != nil {
+		custom := make(map[string]any, len(tokenClaims.Custom)+1)
+		maps.Copy(custom, tokenClaims.Custom)
+		custom["key"] = *cfg.applicationKey
+		tokenClaims.Custom = custom
 	}
 	alignTokenIdentifiers(tokenClaims, tokenID)
 

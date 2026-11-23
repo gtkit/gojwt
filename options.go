@@ -3,6 +3,7 @@ package gojwt
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	jwtv5 "github.com/golang-jwt/jwt/v5"
@@ -53,6 +54,9 @@ type config struct {
 	// keyID 写入 JWT header 的 kid 字段，标识本实例使用的密钥。
 	// 为空时不写入 kid，保持与旧版本一致的 header。
 	keyID string
+
+	// applicationKey 写入 JWT payload 顶层的 key claim，用于 APISIX jwt-auth 定位 Consumer。
+	applicationKey *string
 
 	// numericSubject 只兼容旧签发方的整数 sub，不改变默认字符串校验。
 	numericSubject     bool
@@ -235,6 +239,17 @@ func WithKeyID(kid string) Option {
 	}
 }
 
+// WithApplicationKey 设置 JWT payload 顶层的 key claim。
+//
+// 此选项可省略。显式传入空字符串或全空白值时，构造函数返回 ErrInvalidConfig。
+// APISIX jwt-auth 使用此值匹配 Consumer Credential 的 key。
+// GenerateToken 使用配置值，RefreshToken 保留原 token 的 key。
+func WithApplicationKey(key string) Option {
+	return func(c *config) {
+		c.applicationKey = &key
+	}
+}
+
 // WithHMACSigningMethod 为 JwtHmac 设置签名算法。
 // 默认使用 HS256，可选 HS384、HS512。
 func WithHMACSigningMethod(method *jwtv5.SigningMethodHMAC) Option {
@@ -295,6 +310,9 @@ func newConfig(options ...Option) (config, error) {
 	}
 	if err := validateConfig(cfg); err != nil {
 		return config{}, err
+	}
+	if cfg.applicationKey != nil && strings.TrimSpace(*cfg.applicationKey) == "" {
+		return config{}, fmt.Errorf("%w: WithApplicationKey requires a non-blank application key", ErrInvalidConfig)
 	}
 	cfg.blacklistCheck = resolveBlacklistCheck(cfg)
 	return cfg, nil

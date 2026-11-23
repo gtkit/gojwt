@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.3.0] - 2026-11-23
+
+### Added
+
+- `WithApplicationKey` 为 APISIX `jwt-auth` 签发可选的顶层 `key`。省略选项时沿用原有签发行为，续签保留原 token 的 `key`。
+
 ## [v1.2.0] - 2026-10-15
 
 保持 `github.com/gtkit/gojwt` 模块路径、现有公开签名与接口方法集；升级命令：
